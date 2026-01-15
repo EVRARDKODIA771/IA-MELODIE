@@ -2,13 +2,13 @@ version: "3.9"
 
 services:
   engine:
-    build: ./engine
+    build: .
     container_name: melody_engine
     ports:
       - "8000:8000"
 
   server:
-    build: ./server
+    build: .
     container_name: melody_server
     ports:
       - "3000:3000"
