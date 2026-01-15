@@ -1,0 +1,61 @@
+.recorder-container {
+  max-width: 420px;
+  margin: auto;
+  padding: 20px;
+  text-align: center;
+  font-family: system-ui, sans-serif;
+}
+
+.indicator {
+  width: 20px;
+  height: 20px;
+  margin: 10px auto;
+  border-radius: 50%;
+  background: #ccc;
+}
+
+.indicator.on {
+  background: red;
+  animation: pulse 1s infinite;
+}
+
+@keyframes pulse {
+  0% { opacity: 1; }
+  50% { opacity: .3; }
+  100% { opacity: 1; }
+}
+
+.time {
+  font-size: 2rem;
+  margin: 10px 0;
+}
+
+.status {
+  color: #666;
+}
+
+.buttons button,
+.send {
+  margin: 8px;
+  padding: 10px 16px;
+  font-size: 1rem;
+  border-radius: 8px;
+  border: none;
+  cursor: pointer;
+}
+
+.send {
+  background: #0a7cff;
+  color: white;
+}
+
+.result {
+  text-align: left;
+  background: #111;
+  color: #0f0;
+  padding: 10px;
+  margin-top: 15px;
+  border-radius: 8px;
+  font-size: 0.8rem;
+  overflow-x: auto;
+}
