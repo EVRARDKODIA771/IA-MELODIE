@@ -79,7 +79,7 @@ export default function Recorder() {
     const formData = new FormData();
     formData.append("file", audioBlob, "recording.webm");
 
-    await fetch("https://TON-RENDER.onrender.com/melody/upload", {
+    await fetch("https://ia-melodie.onrender.com/melody/upload", {
       method: "POST",
       body: formData
     });
@@ -88,7 +88,7 @@ export default function Recorder() {
 
     // Récupération résultat
     const interval = setInterval(async () => {
-      const res = await fetch("https://TON-RENDER.onrender.com/melody/result");
+      const res = await fetch("https://ia-melodie.onrender.com/melody/result");
       if (res.ok) {
         const json = await res.json();
         setResult(json.result);
