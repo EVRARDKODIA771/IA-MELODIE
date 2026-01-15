@@ -1,27 +1,35 @@
-# Utiliser Python 3.10 slim
-FROM python:3.10-slim
+# Base Node + Python
+FROM node:20-slim
 
-# Répertoire de travail à la racine du container
+# Répertoire de travail
 WORKDIR /app
 
-# Installer dépendances système pour audio / compilation
+# Installer Python et dépendances système
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
     ffmpeg \
     libsndfile1 \
     build-essential \
     libatlas3-base \
     && rm -rf /var/lib/apt/lists/*
 
-# Copier requirements et installer
-COPY requirements.txt .
-RUN pip install --upgrade pip
-RUN pip install --no-cache-dir -r requirements.txt
+# Copier package.json et package-lock.json pour Node
+COPY package*.json ./
 
-# Copier tout le projet
+# Installer dépendances Node
+RUN npm install
+
+# Copier requirements Python et installer
+COPY requirements.txt .
+RUN pip3 install --upgrade pip
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+# Copier tout le projet (Node + Python + modules)
 COPY . .
 
-# Exposer le port utilisé par Python
-EXPOSE 8000
+# Exposer le port pour Render (Node écoute sur 3000)
+EXPOSE 3000
 
-# Lancer le serveur Python
-CMD ["python3", "app.py"]
+# Lancer Node comme processus principal
+CMD ["node", "server.js"]
