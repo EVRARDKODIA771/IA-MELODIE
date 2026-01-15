@@ -5,11 +5,11 @@ FROM python:3.10-slim
 WORKDIR /app
 
 # Installer dépendances système pour audio / compilation
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsndfile1 \
     build-essential \
-    libatlas-base-dev \
+    libatlas3-base \
     && rm -rf /var/lib/apt/lists/*
 
 # Copier requirements et installer
@@ -17,7 +17,7 @@ COPY requirements.txt .
 RUN pip install --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copier tout le projet (tout est à la racine)
+# Copier tout le projet
 COPY . .
 
 # Exposer le port utilisé par Python
