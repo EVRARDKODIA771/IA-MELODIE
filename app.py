@@ -1,6 +1,7 @@
 from fastapi import FastAPI, UploadFile, File
 import tempfile, os
 
+# Modules internes (tout reste à la racine, chemins relatifs)
 from audio.preprocess import load_audio
 from melody.extract import extract_pitch
 from melody.fingerprint import pitch_to_fingerprint
@@ -12,11 +13,13 @@ app = FastAPI()
 async def fingerprint(file: UploadFile = File(...)):
     log("📥 Audio reçu depuis Node.js")
 
+    # Enregistrer le fichier temporaire
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
         tmp.write(await file.read())
         path = tmp.name
 
     try:
+        # Extraire la mélodie
         y, sr = load_audio(path)
         pitch = extract_pitch(y, sr)
         fingerprint = pitch_to_fingerprint(pitch)
@@ -32,4 +35,5 @@ async def fingerprint(file: UploadFile = File(...)):
         return {"status": "error", "message": str(e)}
 
     finally:
+        # Supprimer le fichier temporaire
         os.remove(path)
