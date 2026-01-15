@@ -5,63 +5,123 @@ import { spawn } from "child_process";
 import path from "path";
 
 const app = express();
+
+/**
+ * Render fournit /tmp → OK pour fichiers temporaires
+ */
 const upload = multer({ dest: "/tmp" });
 
-// Chemin vers le script Python
+/**
+ * Chemin absolu vers app.py
+ */
 const pythonPath = path.join(process.cwd(), "app.py");
 
-// Stockage temporaire de la dernière réponse de Python
+/**
+ * Stockage temporaire du dernier résultat
+ * (OK pour MVP / démo — à améliorer plus tard)
+ */
 let lastPythonResponse = null;
 
-// Route POST où Wix envoie la mélodie
-app.post("/melody/upload", upload.single("file"), async (req, res) => {
+/**
+ * =========================
+ * POST /melody/upload
+ * Wix / React envoie l'audio
+ * =========================
+ */
+app.post("/melody/upload", upload.single("file"), (req, res) => {
   try {
-    console.log("📥 Audio reçu depuis Wix");
+    if (!req.file) {
+      return res.status(400).json({
+        status: "error",
+        message: "Aucun fichier audio reçu"
+      });
+    }
+
+    console.log("📥 Audio reçu :", req.file.originalname);
 
     const filePath = req.file.path;
 
-    // Lancer Python avec le fichier audio
+    /**
+     * Lancer Python avec le fichier audio
+     */
     const python = spawn("python3", [pythonPath, filePath]);
 
-    let data = "";
-    let errorData = "";
+    let stdoutData = "";
+    let stderrData = "";
 
-    python.stdout.on("data", chunk => data += chunk.toString());
-    python.stderr.on("data", chunk => errorData += chunk.toString());
+    python.stdout.on("data", chunk => {
+      stdoutData += chunk.toString();
+    });
+
+    python.stderr.on("data", chunk => {
+      stderrData += chunk.toString();
+    });
 
     python.on("close", code => {
-      fs.unlinkSync(filePath); // supprimer le fichier temporaire
+      // Nettoyage fichier temporaire
+      fs.unlink(filePath, () => {});
 
       if (code !== 0) {
-        console.error("❌ Erreur Python :", errorData);
-        return res.status(500).json({ status: "error", message: errorData });
+        console.error("❌ Python a quitté avec erreur :", stderrData);
+        return res.status(500).json({
+          status: "error",
+          message: "Erreur lors du traitement IA"
+        });
       }
 
       try {
-        const json = JSON.parse(data);
-        lastPythonResponse = json; // stocker la réponse pour GET
-        res.json({ status: "ok", message: "Fichier traité, prêt pour fetch" });
-      } catch (e) {
-        console.error("❌ Erreur parsing JSON :", e.message);
-        res.status(500).json({ status: "error", message: e.message });
+        const result = JSON.parse(stdoutData);
+        lastPythonResponse = result;
+
+        res.json({
+          status: "ok",
+          message: "Audio traité avec succès"
+        });
+
+      } catch (err) {
+        console.error("❌ JSON invalide retourné par Python :", stdoutData);
+        res.status(500).json({
+          status: "error",
+          message: "Réponse IA invalide"
+        });
       }
     });
 
   } catch (err) {
-    console.error("❌ Erreur Node:", err.message);
-    res.status(500).json({ status: "error", message: err.message });
+    console.error("❌ Erreur Node :", err.message);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
   }
 });
 
-// Route GET pour que Wix récupère la réponse
+/**
+ * =========================
+ * GET /melody/result
+ * Wix récupère le résultat
+ * =========================
+ */
 app.get("/melody/result", (req, res) => {
   if (!lastPythonResponse) {
-    return res.status(404).json({ status: "error", message: "Pas de résultat disponible" });
+    return res.status(404).json({
+      status: "error",
+      message: "Aucun résultat disponible"
+    });
   }
-  res.json({ status: "ok", result: lastPythonResponse });
+
+  res.json({
+    status: "ok",
+    result: lastPythonResponse
+  });
 });
 
-// Lancer le serveur Node
-app.listen(3000, () => {
-  console.log("🚀 Node API démarrée sur le port 3000");
+/**
+ * =========================
+ * Lancement serveur (OBLIGATOIRE Render)
+ * =========================
+ */
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 Node API démarrée sur le port ${PORT}`);
 });
