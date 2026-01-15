@@ -3,7 +3,7 @@ import json
 import os
 import tempfile
 
-# Ici tu dois importer tes modules d'IA
+# Importer les modules d'IA
 from audio.preprocess import load_audio
 from melody.extract import extract_pitch
 from melody.fingerprint import pitch_to_fingerprint
@@ -13,7 +13,7 @@ def process_audio(file_path):
     try:
         log(f"📥 Traitement du fichier {file_path}")
 
-        # Exemple : charger audio, extraire pitch, transformer en "paroles" fictives
+        # Charger audio, extraire pitch, transformer en "paroles" fictives
         y, sr = load_audio(file_path)
         pitch = extract_pitch(y, sr)
         fingerprint = pitch_to_fingerprint(pitch)
@@ -34,14 +34,14 @@ def process_audio(file_path):
         return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print(json.dumps({"status": "error", "message": "Aucun fichier fourni"}))
-        sys.exit(1)
-
-    file_path = sys.argv[1]
-
-    # Appeler le traitement
-    result = process_audio(file_path)
-
-    # Retourner le JSON à Node
-    print(json.dumps(result))
+    # Vérifier si un fichier a été fourni
+    if len(sys.argv) >= 2:
+        file_path = sys.argv[1]
+        result = process_audio(file_path)
+        print(json.dumps(result))
+    else:
+        # Aucun fichier fourni → juste loguer et continuer
+        log("⚠️ Aucun fichier fourni, app.py lancé sans traitement. Prêt à recevoir des fichiers via Node.")
+        # Ne pas planter Render
+        # Si tu veux, tu peux rester en mode serveur ou juste passer
+        pass
