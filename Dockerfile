@@ -1,7 +1,6 @@
-# Base Node + Python
-FROM node:20-slim
+# Base Node complète (bullseye)
+FROM node:20-bullseye
 
-# Répertoire de travail
 WORKDIR /app
 
 # Installer Python et dépendances système
@@ -12,23 +11,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     build-essential \
     libatlas3-base \
+    libffi-dev \
+    libssl-dev \
+    cmake \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
-# Copier package.json et package-lock.json pour Node
+# Copier package.json et installer Node deps
 COPY package*.json ./
-
-# Installer dépendances Node
 RUN npm install
 
-# Copier requirements Python et installer
+# Copier requirements Python
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Copier tout le projet (Node + Python + modules)
+# Installer Torch via wheel précompilé pour éviter build
+RUN pip3 install torch==2.1.0 --index-url https://download.pytorch.org/whl/cpu
+
+# Installer le reste des dépendances Python
+RUN pip3 install --no-cache-dir fastapi==0.109.0 uvicorn[standard]==0.25.0 numpy==1.26.0 scipy==1.11.0 librosa==0.10.1 soundfile==0.12.1 crepe==0.0.16
+
+# Copier tout le projet
 COPY . .
 
-# Exposer le port pour Render (Node écoute sur 3000)
+# Exposer le port pour Render
 EXPOSE 3000
 
-# Lancer Node comme processus principal
+# Lancer Node comme process principal
 CMD ["node", "server.js"]
