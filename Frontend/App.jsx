@@ -1,18 +1,25 @@
 import Recorder from "./Recorder.jsx";
 import { useEffect } from "react";
-useEffect(async() => {
-  const pingBackend = () => {
-    fetch("https://ia-melodie.onrender.com/ping").catch(() => {});
+
+useEffect(() => {
+  const pingBackend = async () => {
+    try {
+      await fetch("https://ia-melodie.onrender.com/ping");
+    } catch (err) {
+      console.error("Ping backend failed", err);
+    }
   };
+
+  // Ping immédiat au chargement
+  pingBackend();
 
   // Ping toutes les 5 minutes
   const interval = setInterval(pingBackend, 5 * 60 * 1000);
 
-  // Ping immédiat au chargement
-  await pingBackend();
-
+  // Cleanup à la destruction du composant
   return () => clearInterval(interval);
 }, []);
+
 
 function App() {
   return (
