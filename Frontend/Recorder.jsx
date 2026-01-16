@@ -1,4 +1,5 @@
 import { useRef, useState } from "react";
+import { identifyAudio } from "./auddAPI"; // ton API helper
 import "./Recorder.css";
 
 export default function Recorder() {
@@ -77,32 +78,20 @@ export default function Recorder() {
   };
 
   // ======================
-  // SEND TO BACKEND
+  // SEND TO BACKEND via identifyAudio
   // ======================
   const sendAudio = async () => {
     if (!audioBlob) return;
-
     setStatus("📤 Envoi au serveur...");
 
-    const formData = new FormData();
-    formData.append("file", audioBlob, "recording.webm");
-
-    await fetch("https://ia-melodie.onrender.com/melody/upload", {
-      method: "POST",
-      body: formData
-    });
-
-    setStatus("🔍 Analyse IA en cours...");
-
-    const interval = setInterval(async () => {
-      const res = await fetch("https://ia-melodie.onrender.com/melody/result");
-      if (res.ok) {
-        const json = await res.json();
-        setResult(json.result);
-        setStatus("✅ Musique identifiée");
-        clearInterval(interval);
-      }
-    }, 2000);
+    try {
+      const res = await identifyAudio(new File([audioBlob], "recording.webm"));
+      setResult(res.result);
+      setStatus("✅ Analyse terminée !");
+    } catch (err) {
+      console.error(err);
+      setStatus("❌ Erreur d'identification");
+    }
   };
 
   // ======================
@@ -147,9 +136,7 @@ export default function Recorder() {
 
       {/* RESULT */}
       {result && (
-        <pre className="result">
-{JSON.stringify(result, null, 2)}
-        </pre>
+        <pre className="result">{JSON.stringify(result, null, 2)}</pre>
       )}
     </div>
   );
