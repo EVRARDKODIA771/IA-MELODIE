@@ -7,7 +7,9 @@ import path from "path";
 const app = express();
 
 /**
- * Render fournit /tmp → OK pour fichiers temporaires
+ * =========================
+ * Configuration upload (Render)
+ * =========================
  */
 const upload = multer({ dest: "/tmp" });
 
@@ -17,15 +19,28 @@ const upload = multer({ dest: "/tmp" });
 const pythonPath = path.join(process.cwd(), "app.py");
 
 /**
- * Stockage temporaire du dernier résultat
- * (OK pour MVP / démo — à améliorer plus tard)
+ * Stockage temporaire du dernier résultat Python
+ * (OK pour MVP / démo)
  */
-let lastPythonResponse = null;
+let lastResult = null;
+
+/**
+ * =========================
+ * GET /ping
+ * 👉 Réveille le backend Render
+ * =========================
+ */
+app.get("/ping", (req, res) => {
+  res.json({
+    status: "ok",
+    message: "Backend awake"
+  });
+});
 
 /**
  * =========================
  * POST /melody/upload
- * Wix / React envoie l'audio
+ * 👉 Wix / React envoie l'audio
  * =========================
  */
 app.post("/melody/upload", upload.single("file"), (req, res) => {
@@ -62,16 +77,23 @@ app.post("/melody/upload", upload.single("file"), (req, res) => {
       fs.unlink(filePath, () => {});
 
       if (code !== 0) {
-        console.error("❌ Python a quitté avec erreur :", stderrData);
+        console.error("❌ Python error :", stderrData);
         return res.status(500).json({
           status: "error",
-          message: "Erreur lors du traitement IA"
+          message: "Erreur lors du traitement Python"
         });
       }
 
       try {
-        const result = JSON.parse(stdoutData);
-        lastPythonResponse = result;
+        /**
+         * Résultat Python attendu :
+         * {
+         *   lyrics: "...",
+         *   global_match: {...},
+         *   wix_match: {...}
+         * }
+         */
+        lastResult = JSON.parse(stdoutData);
 
         res.json({
           status: "ok",
@@ -99,11 +121,11 @@ app.post("/melody/upload", upload.single("file"), (req, res) => {
 /**
  * =========================
  * GET /melody/result
- * Wix récupère le résultat
+ * 👉 Résultat complet (debug / legacy)
  * =========================
  */
 app.get("/melody/result", (req, res) => {
-  if (!lastPythonResponse) {
+  if (!lastResult) {
     return res.status(404).json({
       status: "error",
       message: "Aucun résultat disponible"
@@ -112,13 +134,43 @@ app.get("/melody/result", (req, res) => {
 
   res.json({
     status: "ok",
-    result: lastPythonResponse
+    result: lastResult
   });
 });
 
 /**
  * =========================
- * Lancement serveur (OBLIGATOIRE Render)
+ * GET /result/lyrics
+ * 👉 Paroles reconnues (toutes langues)
+ * =========================
+ */
+app.get("/result/lyrics", (req, res) => {
+  res.json(lastResult?.lyrics || null);
+});
+
+/**
+ * =========================
+ * GET /result/global
+ * 👉 Shazam-like (YouTube / Spotify / Web)
+ * =========================
+ */
+app.get("/result/global", (req, res) => {
+  res.json(lastResult?.global_match || null);
+});
+
+/**
+ * =========================
+ * GET /result/wix
+ * 👉 Match avec ta BDD Wix
+ * =========================
+ */
+app.get("/result/wix", (req, res) => {
+  res.json(lastResult?.wix_match || null);
+});
+
+/**
+ * =========================
+ * Lancement serveur (Render)
  * =========================
  */
 const PORT = process.env.PORT || 3000;
