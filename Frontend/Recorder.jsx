@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import "./Recorder.css";
 
 export default function Recorder() {
@@ -10,14 +10,16 @@ export default function Recorder() {
   const [isPaused, setIsPaused] = useState(false);
   const [audioBlob, setAudioBlob] = useState(null);
   const [time, setTime] = useState(0);
-  const [status, setStatus] = useState("");
+  const [status, setStatus] = useState("Touchez le micro pour chanter");
   const [result, setResult] = useState(null);
 
   // Format mm:ss
   const formatTime = (s) =>
     `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 
-  // Démarrer enregistrement
+  // ======================
+  // START
+  // ======================
   const startRecording = async () => {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     const recorder = new MediaRecorder(stream);
@@ -35,14 +37,16 @@ export default function Recorder() {
     setIsRecording(true);
     setIsPaused(false);
     setTime(0);
-    setStatus("🎙️ Enregistrement en cours");
+    setStatus("🎶 Écoute en cours...");
 
     timerRef.current = setInterval(() => {
       setTime(t => t + 1);
     }, 1000);
   };
 
-  // Pause / reprise
+  // ======================
+  // PAUSE / RESUME
+  // ======================
   const togglePause = () => {
     if (!mediaRecorderRef.current) return;
 
@@ -54,23 +58,27 @@ export default function Recorder() {
     } else {
       mediaRecorderRef.current.resume();
       setIsPaused(false);
-      setStatus("🎙️ Enregistrement en cours");
+      setStatus("🎶 Écoute en cours...");
       timerRef.current = setInterval(() => {
         setTime(t => t + 1);
       }, 1000);
     }
   };
 
-  // Stop
+  // ======================
+  // STOP
+  // ======================
   const stopRecording = () => {
     mediaRecorderRef.current.stop();
     mediaRecorderRef.current.stream.getTracks().forEach(t => t.stop());
     clearInterval(timerRef.current);
     setIsRecording(false);
-    setStatus("⏹️ Enregistrement terminé");
+    setStatus("🧠 Prêt pour l’analyse");
   };
 
-  // Envoi au backend Render
+  // ======================
+  // SEND TO BACKEND
+  // ======================
   const sendAudio = async () => {
     if (!audioBlob) return;
 
@@ -84,42 +92,60 @@ export default function Recorder() {
       body: formData
     });
 
-    setStatus("⏳ Analyse en cours...");
+    setStatus("🔍 Analyse IA en cours...");
 
-    // Récupération résultat
     const interval = setInterval(async () => {
       const res = await fetch("https://ia-melodie.onrender.com/melody/result");
       if (res.ok) {
         const json = await res.json();
         setResult(json.result);
-        setStatus("✅ Analyse terminée");
+        setStatus("✅ Musique identifiée");
         clearInterval(interval);
       }
     }, 2000);
   };
 
+  // ======================
+  // UI
+  // ======================
   return (
     <div className="recorder-container">
-      <h1>🎵 Chanter ou enregistrer une musique </h1>
+      <div className="title">IA Mélodie</div>
+      <div className="subtitle">Chantez ou fredonnez une musique</div>
 
-      <div className={`indicator ${isRecording ? "on" : ""}`} />
-
-      <div className="time">{formatTime(time)}</div>
-      <p className="status">{status}</p>
-
-      <div className="buttons">
-        {!isRecording && <button onClick={startRecording}>🎙️ Démarrer</button>}
-        {isRecording && <button onClick={togglePause}>{isPaused ? "▶️ Reprendre" : "⏸️ Pause"}</button>}
-        {isRecording && <button onClick={stopRecording}>⏹️ Stop</button>}
+      {/* SHAZAM CIRCLE */}
+      <div
+        className="pulse-wrapper"
+        onClick={!isRecording ? startRecording : stopRecording}
+      >
+        {isRecording && !isPaused && <div className="pulse" />}
+        {isRecording && !isPaused && <div className="pulse delay" />}
+        <div className="center-circle">🎤</div>
       </div>
 
-      {audioBlob && (
-        <>
-          <audio controls src={URL.createObjectURL(audioBlob)} />
-          <button className="send" onClick={sendAudio}>📤 Analyser la musique</button>
-        </>
+      {/* TIMER */}
+      <div className="time">{formatTime(time)}</div>
+
+      {/* STATUS */}
+      <div className="status">{status}</div>
+
+      {/* CONTROLS */}
+      {isRecording && (
+        <div className="buttons">
+          <button onClick={togglePause}>
+            {isPaused ? "▶️ Reprendre" : "⏸️ Pause"}
+          </button>
+        </div>
       )}
 
+      {/* SEND */}
+      {audioBlob && !isRecording && (
+        <button className="send" onClick={sendAudio}>
+          🔍 Identifier la musique
+        </button>
+      )}
+
+      {/* RESULT */}
       {result && (
         <pre className="result">
 {JSON.stringify(result, null, 2)}
