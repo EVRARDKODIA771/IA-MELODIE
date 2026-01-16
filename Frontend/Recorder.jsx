@@ -100,7 +100,7 @@ export default function Recorder() {
 
   return (
     <div className="recorder-container">
-      <h1>🎵 Reconnaissance musicale</h1>
+      <h1>🎵 Chanter ou enregistrer une musique </h1>
 
       <div className={`indicator ${isRecording ? "on" : ""}`} />
 
