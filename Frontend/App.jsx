@@ -1,4 +1,4 @@
-import Recorder from "./Recorder";
+import Recorder from "./Recorder.jsx";
 
 function App() {
   return (
