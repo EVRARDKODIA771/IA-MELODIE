@@ -110,7 +110,7 @@ export default function Recorder() {
   // ======================
   return (
     <div className="recorder-container">
-      <div className="title">IA Mélodie</div>
+      <div className="title">PARTITION MANAGER</div>
       <div className="subtitle">Chantez ou fredonnez une musique</div>
 
       {/* SHAZAM CIRCLE */}
