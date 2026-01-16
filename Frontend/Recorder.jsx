@@ -1,5 +1,4 @@
 import { useRef, useState } from "react";
-import { identifyAudio } from "./auddAPI"; // ton API helper
 import "./Recorder.css";
 
 export default function Recorder() {
@@ -19,7 +18,7 @@ export default function Recorder() {
     `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 
   // ======================
-  // START
+  // START RECORDING
   // ======================
   const startRecording = async () => {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -38,11 +37,9 @@ export default function Recorder() {
     setIsRecording(true);
     setIsPaused(false);
     setTime(0);
-    setStatus("🎶 Écoute en cours...");
+    setStatus("🎶 Enregistrement en cours...");
 
-    timerRef.current = setInterval(() => {
-      setTime(t => t + 1);
-    }, 1000);
+    timerRef.current = setInterval(() => setTime(t => t + 1), 1000);
   };
 
   // ======================
@@ -59,17 +56,16 @@ export default function Recorder() {
     } else {
       mediaRecorderRef.current.resume();
       setIsPaused(false);
-      setStatus("🎶 Écoute en cours...");
-      timerRef.current = setInterval(() => {
-        setTime(t => t + 1);
-      }, 1000);
+      setStatus("🎶 Enregistrement en cours...");
+      timerRef.current = setInterval(() => setTime(t => t + 1), 1000);
     }
   };
 
   // ======================
-  // STOP
+  // STOP RECORDING
   // ======================
   const stopRecording = () => {
+    if (!mediaRecorderRef.current) return;
     mediaRecorderRef.current.stop();
     mediaRecorderRef.current.stream.getTracks().forEach(t => t.stop());
     clearInterval(timerRef.current);
@@ -78,16 +74,27 @@ export default function Recorder() {
   };
 
   // ======================
-  // SEND TO BACKEND via identifyAudio
+  // SEND TO BACKEND AUdD
   // ======================
   const sendAudio = async () => {
     if (!audioBlob) return;
+
     setStatus("📤 Envoi au serveur...");
 
+    const formData = new FormData();
+    formData.append("file", audioBlob, "recording.webm");
+
     try {
-      const res = await identifyAudio(new File([audioBlob], "recording.webm"));
-      setResult(res.result);
-      setStatus("✅ Analyse terminée !");
+      const res = await fetch("https://ia-melodie.onrender.com/melody/upload?backend=audd", {
+        method: "POST",
+        body: formData
+      });
+
+      if (!res.ok) throw new Error("Erreur serveur");
+
+      const json = await res.json();
+      setResult(json.result);
+      setStatus("✅ Musique identifiée !");
     } catch (err) {
       console.error(err);
       setStatus("❌ Erreur d'identification");
