@@ -41,7 +41,6 @@ export default function Recorder() {
   const [audioBlob, setAudioBlob] = useState(null);
   const [time, setTime] = useState(0);
   const [status, setStatus] = useState("Touchez le micro pour chanter");
-  const [result, setResult] = useState(null);
 
   const formatTime = (s) =>
     `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
@@ -121,12 +120,12 @@ export default function Recorder() {
 
       if (!res.ok) throw new Error("Erreur serveur");
 
-      const json = await res.json();
-      setResult(json.result);
-      setStatus("✅ Musique identifiée !");
+      // On ne stocke plus le JSON dans le frontend
+      setStatus("✅ Musique envoyée et identifiée sur le backend !");
+      setAudioBlob(null); // reset pour nouvel enregistrement
     } catch (err) {
       console.error(err);
-      setStatus("❌ Erreur d'identification");
+      setStatus("❌ Erreur lors de l'envoi");
     }
   };
 
@@ -169,9 +168,6 @@ export default function Recorder() {
           🔍 Identifier la musique
         </button>
       )}
-
-      {/* RESULT */}
-      {result && <pre className="result">{JSON.stringify(result, null, 2)}</pre>}
     </div>
   );
 }
