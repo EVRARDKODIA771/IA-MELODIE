@@ -6,30 +6,14 @@ import "./Recorder.css";
 // ======================
 const backendUrl = import.meta.env.VITE_BACKEND_URL;
 
+// Récupérer le returnUrl passé en query param (depuis Wix)
+const urlParams = new URLSearchParams(window.location.search);
+const returnUrl = urlParams.get("returnUrl");
+
 // Fonction utilitaire pour générer un JobID unique
 const generateJobId = () => "job-" + Math.random().toString(36).substr(2, 9);
 
 export default function Recorder() {
-  // ======================
-  // ANTI-SOMMEIL / PING BACKEND
-  // ======================
-  useEffect(() => {
-    const pingBackend = async () => {
-      try {
-        await fetch(`${backendUrl}/ping`);
-      } catch (err) {
-        console.error("Ping backend failed", err);
-      }
-    };
-
-    pingBackend();
-    const interval = setInterval(pingBackend, 5 * 60 * 1000);
-    return () => clearInterval(interval);
-  }, []);
-
-  // ======================
-  // STATES
-  // ======================
   const mediaRecorderRef = useRef(null);
   const chunksRef = useRef([]);
   const timerRef = useRef(null);
@@ -44,6 +28,22 @@ export default function Recorder() {
 
   const formatTime = (s) =>
     `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+
+  // ======================
+  // PING BACKEND
+  // ======================
+  useEffect(() => {
+    const pingBackend = async () => {
+      try {
+        await fetch(`${backendUrl}/ping`);
+      } catch (err) {
+        console.error("Ping backend failed", err);
+      }
+    };
+    pingBackend();
+    const interval = setInterval(pingBackend, 5 * 60 * 1000);
+    return () => clearInterval(interval);
+  }, []);
 
   // ======================
   // START RECORDING (auto stop 7s)
@@ -74,10 +74,8 @@ export default function Recorder() {
     setTime(0);
     setStatus("🎶 Enregistrement en cours...");
 
-    // Timer
     timerRef.current = setInterval(() => setTime((t) => t + 1), 1000);
 
-    // Auto-stop après 7 secondes
     setTimeout(() => {
       if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
         stopRecording();
@@ -85,12 +83,8 @@ export default function Recorder() {
     }, 7000);
   };
 
-  // ======================
-  // PAUSE / RESUME
-  // ======================
   const togglePause = () => {
     if (!mediaRecorderRef.current) return;
-
     if (mediaRecorderRef.current.state === "recording") {
       mediaRecorderRef.current.pause();
       setIsPaused(true);
@@ -104,9 +98,6 @@ export default function Recorder() {
     }
   };
 
-  // ======================
-  // STOP RECORDING
-  // ======================
   const stopRecording = () => {
     if (!mediaRecorderRef.current) return;
     mediaRecorderRef.current.stop();
@@ -116,7 +107,7 @@ export default function Recorder() {
   };
 
   // ======================
-  // SEND AUDIO AUdD
+  // SEND AUDIO AUdD + redirect returnUrl
   // ======================
   const sendAudio = async (blob, jobId) => {
     if (!blob || !jobId) return;
@@ -133,24 +124,29 @@ export default function Recorder() {
 
       if (!res.ok) throw new Error("Erreur serveur");
 
+      // URL pour récupérer le JSON
       const resultUrl = `${backendUrl}/melody/result/${jobId}?backend=audd`;
-      setStatus(`✅ Musique envoyée ! Récupérer le résultat ici : ${resultUrl}`);
-      setResult({ jobId, resultUrl });
+
+      setStatus("✅ Musique envoyée ! Récupération en cours...");
+
+      // Si returnUrl est défini, rediriger vers Wix avec jobId et resultUrl
+      if (returnUrl) {
+        const wixRedirect = `${decodeURIComponent(returnUrl)}?jobId=${jobId}&resultUrl=${encodeURIComponent(resultUrl)}`;
+        window.location.href = wixRedirect;
+      } else {
+        setResult({ jobId, resultUrl });
+      }
     } catch (err) {
       console.error(err);
       setStatus("❌ Erreur d'identification");
     }
   };
 
-  // ======================
-  // UI
-  // ======================
   return (
     <div className="recorder-container">
       <div className="title">PARTITION MANAGER</div>
       <div className="subtitle">Chantez ou fredonnez une musique</div>
 
-      {/* SHAZAM CIRCLE */}
       <div
         className="pulse-wrapper"
         onClick={!isRecording ? startRecording : stopRecording}
@@ -160,13 +156,9 @@ export default function Recorder() {
         <div className="center-circle">🎤</div>
       </div>
 
-      {/* TIMER */}
       <div className="time">{formatTime(time)}</div>
-
-      {/* STATUS */}
       <div className="status">{status}</div>
 
-      {/* CONTROLS */}
       {isRecording && (
         <div className="buttons">
           <button onClick={togglePause}>
@@ -175,7 +167,6 @@ export default function Recorder() {
         </div>
       )}
 
-      {/* RESULT */}
       {result && (
         <div className="result">
           <p>JobID : {result.jobId}</p>
