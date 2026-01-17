@@ -7,10 +7,7 @@ import "./Recorder.css";
 const backendUrl = import.meta.env.VITE_BACKEND_URL;
 
 // Fonction utilitaire pour générer un JobID unique
-const generateJobId = () => {
-  // Exemple UUID simple
-  return "job-" + Math.random().toString(36).substr(2, 9);
-};
+const generateJobId = () => "job-" + Math.random().toString(36).substr(2, 9);
 
 export default function Recorder() {
   // ======================
@@ -25,18 +22,13 @@ export default function Recorder() {
       }
     };
 
-    // Ping immédiat au chargement
     pingBackend();
-
-    // Ping toutes les 5 minutes
     const interval = setInterval(pingBackend, 5 * 60 * 1000);
-
-    // Cleanup
     return () => clearInterval(interval);
   }, []);
 
   // ======================
-  // RECORDER STATES
+  // STATES
   // ======================
   const mediaRecorderRef = useRef(null);
   const chunksRef = useRef([]);
@@ -48,13 +40,13 @@ export default function Recorder() {
   const [time, setTime] = useState(0);
   const [status, setStatus] = useState("Touchez le micro pour chanter");
   const [result, setResult] = useState(null);
-  const [jobId, setJobId] = useState(null); // JobID pour cet enregistrement
+  const [jobId, setJobId] = useState(null);
 
   const formatTime = (s) =>
     `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 
   // ======================
-  // START RECORDING
+  // START RECORDING (auto stop 7s)
   // ======================
   const startRecording = async () => {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -62,13 +54,18 @@ export default function Recorder() {
 
     mediaRecorderRef.current = recorder;
     chunksRef.current = [];
+    setAudioBlob(null);
+    setResult(null);
+
+    const newJobId = generateJobId();
+    setJobId(newJobId);
 
     recorder.ondataavailable = (e) => chunksRef.current.push(e.data);
     recorder.onstop = () => {
       const blob = new Blob(chunksRef.current, { type: "audio/webm" });
       setAudioBlob(blob);
-      const newJobId = generateJobId(); // Générer un JobID unique pour cette session
-      setJobId(newJobId);
+      setStatus("🧠 Enregistrement terminé, envoi au serveur...");
+      sendAudio(blob, newJobId);
     };
 
     recorder.start();
@@ -77,7 +74,15 @@ export default function Recorder() {
     setTime(0);
     setStatus("🎶 Enregistrement en cours...");
 
+    // Timer
     timerRef.current = setInterval(() => setTime((t) => t + 1), 1000);
+
+    // Auto-stop après 7 secondes
+    setTimeout(() => {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
+        stopRecording();
+      }
+    }, 7000);
   };
 
   // ======================
@@ -108,20 +113,17 @@ export default function Recorder() {
     mediaRecorderRef.current.stream.getTracks().forEach((t) => t.stop());
     clearInterval(timerRef.current);
     setIsRecording(false);
-    setStatus("🧠 Prêt pour l’analyse");
   };
 
   // ======================
-  // SEND TO BACKEND AUdD
+  // SEND AUDIO AUdD
   // ======================
-  const sendAudio = async () => {
-    if (!audioBlob || !jobId) return;
-
-    setStatus("📤 Envoi au serveur...");
+  const sendAudio = async (blob, jobId) => {
+    if (!blob || !jobId) return;
 
     const formData = new FormData();
-    formData.append("file", audioBlob, "recording.webm");
-    formData.append("jobId", jobId); // Envoi du JobID au backend
+    formData.append("file", blob, "recording.webm");
+    formData.append("jobId", jobId);
 
     try {
       const res = await fetch(`${backendUrl}/melody/upload?backend=audd`, {
@@ -131,8 +133,6 @@ export default function Recorder() {
 
       if (!res.ok) throw new Error("Erreur serveur");
 
-      // Ici on ne récupère plus le JSON direct
-      // On peut juste afficher l'URL pour récupérer le résultat plus tard
       const resultUrl = `${backendUrl}/melody/result/${jobId}?backend=audd`;
       setStatus(`✅ Musique envoyée ! Récupérer le résultat ici : ${resultUrl}`);
       setResult({ jobId, resultUrl });
@@ -173,13 +173,6 @@ export default function Recorder() {
             {isPaused ? "▶️ Reprendre" : "⏸️ Pause"}
           </button>
         </div>
-      )}
-
-      {/* SEND */}
-      {audioBlob && !isRecording && (
-        <button className="send" onClick={sendAudio}>
-          🔍 Identifier la musique
-        </button>
       )}
 
       {/* RESULT */}
