@@ -6,6 +6,12 @@ import "./Recorder.css";
 // ======================
 const backendUrl = import.meta.env.VITE_BACKEND_URL;
 
+// Fonction utilitaire pour générer un JobID unique
+const generateJobId = () => {
+  // Exemple UUID simple
+  return "job-" + Math.random().toString(36).substr(2, 9);
+};
+
 export default function Recorder() {
   // ======================
   // ANTI-SOMMEIL / PING BACKEND
@@ -41,6 +47,8 @@ export default function Recorder() {
   const [audioBlob, setAudioBlob] = useState(null);
   const [time, setTime] = useState(0);
   const [status, setStatus] = useState("Touchez le micro pour chanter");
+  const [result, setResult] = useState(null);
+  const [jobId, setJobId] = useState(null); // JobID pour cet enregistrement
 
   const formatTime = (s) =>
     `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
@@ -59,6 +67,8 @@ export default function Recorder() {
     recorder.onstop = () => {
       const blob = new Blob(chunksRef.current, { type: "audio/webm" });
       setAudioBlob(blob);
+      const newJobId = generateJobId(); // Générer un JobID unique pour cette session
+      setJobId(newJobId);
     };
 
     recorder.start();
@@ -105,12 +115,13 @@ export default function Recorder() {
   // SEND TO BACKEND AUdD
   // ======================
   const sendAudio = async () => {
-    if (!audioBlob) return;
+    if (!audioBlob || !jobId) return;
 
     setStatus("📤 Envoi au serveur...");
 
     const formData = new FormData();
     formData.append("file", audioBlob, "recording.webm");
+    formData.append("jobId", jobId); // Envoi du JobID au backend
 
     try {
       const res = await fetch(`${backendUrl}/melody/upload?backend=audd`, {
@@ -120,12 +131,14 @@ export default function Recorder() {
 
       if (!res.ok) throw new Error("Erreur serveur");
 
-      // On ne stocke plus le JSON dans le frontend
-      setStatus("✅ Musique envoyée et identifiée sur le backend !");
-      setAudioBlob(null); // reset pour nouvel enregistrement
+      // Ici on ne récupère plus le JSON direct
+      // On peut juste afficher l'URL pour récupérer le résultat plus tard
+      const resultUrl = `${backendUrl}/melody/result/${jobId}?backend=audd`;
+      setStatus(`✅ Musique envoyée ! Récupérer le résultat ici : ${resultUrl}`);
+      setResult({ jobId, resultUrl });
     } catch (err) {
       console.error(err);
-      setStatus("❌ Erreur lors de l'envoi");
+      setStatus("❌ Erreur d'identification");
     }
   };
 
@@ -167,6 +180,19 @@ export default function Recorder() {
         <button className="send" onClick={sendAudio}>
           🔍 Identifier la musique
         </button>
+      )}
+
+      {/* RESULT */}
+      {result && (
+        <div className="result">
+          <p>JobID : {result.jobId}</p>
+          <p>
+            Récupérer le résultat via :{" "}
+            <a href={result.resultUrl} target="_blank" rel="noopener noreferrer">
+              {result.resultUrl}
+            </a>
+          </p>
+        </div>
       )}
     </div>
   );
