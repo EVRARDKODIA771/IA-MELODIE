@@ -3,7 +3,7 @@ import multer from "multer";
 import fs from "fs";
 import { spawn } from "child_process";
 import path from "path";
-import { fetch } from "node-fetch";
+import fetch from "node-fetch";
 import FormData from "form-data";
 
 const app = express();
