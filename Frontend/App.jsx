@@ -1,6 +1,11 @@
 import Recorder from "./Recorder.jsx";
 import { useEffect } from "react";
 
+// ======================
+// URL du backend depuis .env
+// ======================
+const backendUrl = import.meta.env.VITE_BACKEND_URL;
+
 function App() {
   // ======================
   // Anti-sommeil / Ping backend
@@ -8,7 +13,7 @@ function App() {
   useEffect(() => {
     const pingBackend = async () => {
       try {
-        await fetch("https://ia-melodie.onrender.com/ping");
+        await fetch(`${backendUrl}/ping`);
       } catch (err) {
         console.error("Ping backend failed", err);
       }
