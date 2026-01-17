@@ -1,6 +1,11 @@
 import { useRef, useState, useEffect } from "react";
 import "./Recorder.css";
 
+// ======================
+// URL du backend depuis .env
+// ======================
+const backendUrl = import.meta.env.VITE_BACKEND_URL;
+
 export default function Recorder() {
   // ======================
   // ANTI-SOMMEIL / PING BACKEND
@@ -8,7 +13,7 @@ export default function Recorder() {
   useEffect(() => {
     const pingBackend = async () => {
       try {
-        await fetch("https://ia-melodie.onrender.com/ping");
+        await fetch(`${backendUrl}/ping`);
       } catch (err) {
         console.error("Ping backend failed", err);
       }
@@ -109,13 +114,10 @@ export default function Recorder() {
     formData.append("file", audioBlob, "recording.webm");
 
     try {
-      const res = await fetch(
-        "https://ia-melodie.onrender.com/melody/upload?backend=audd",
-        {
-          method: "POST",
-          body: formData,
-        }
-      );
+      const res = await fetch(`${backendUrl}/melody/upload?backend=audd`, {
+        method: "POST",
+        body: formData,
+      });
 
       if (!res.ok) throw new Error("Erreur serveur");
 
