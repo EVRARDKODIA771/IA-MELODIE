@@ -3,41 +3,45 @@ import multer from "multer";
 import fs from "fs";
 import { spawn } from "child_process";
 import path from "path";
-import fetch from "node-fetch";
+import fetch from "node-fetch"; // fetch corrigé
 import FormData from "form-data";
+import cors from "cors";
 
 const app = express();
 
-/**
- * =========================
- * Ping (réveil backend)
- * =========================
- */
+// =========================
+// Activer CORS pour le frontend
+// =========================
+app.use(cors({
+  origin: ["https://ia-melodie-1.onrender.com", "http://localhost:5173"], // frontend prod + dev
+  methods: ["GET","POST","OPTIONS"],
+  allowedHeaders: ["Content-Type"]
+}));
+
+// =========================
+// Ping backend pour le réveil
+// =========================
 app.get("/ping", (req, res) => {
   res.json({ status: "ok", message: "Backend awake" });
 });
 
-/**
- * =========================
- * Configuration upload
- * =========================
- */
+// =========================
+// Configuration upload
+// =========================
 const upload = multer({ dest: "/tmp" });
 const API_TOKEN = "3523e792bbced184caa4f51a33a2494a";
 const pythonPath = path.join(process.cwd(), "app.py");
 
-/**
- * Stockage des résultats
- */
+// =========================
+// Stockage des résultats
+// =========================
 let lastPythonResult = null;
 let lastAuddResult = null;
 
-/**
- * =========================
- * Endpoint unique upload
- * pipeline=python|audd
- * =========================
- */
+// =========================
+// Endpoint upload
+// pipeline=python|audd
+// =========================
 app.post("/melody/upload", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ status: "error", message: "No file" });
 
@@ -93,12 +97,10 @@ app.post("/melody/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-/**
- * =========================
- * Récupérer le dernier résultat complet
- * ?backend=python|audd
- * =========================
- */
+// =========================
+// Récupérer dernier résultat complet
+// ?backend=python|audd
+// =========================
 app.get("/melody/result", (req, res) => {
   const backend = req.query.backend || "python";
   if (backend === "audd") {
@@ -110,19 +112,15 @@ app.get("/melody/result", (req, res) => {
   }
 });
 
-/**
- * =========================
- * Endpoints legacy Wix (Python uniquement)
- * =========================
- */
+// =========================
+// Endpoints legacy Wix (Python uniquement)
+// =========================
 app.get("/result/lyrics", (req, res) => res.json(lastPythonResult?.lyrics || null));
 app.get("/result/global", (req, res) => res.json(lastPythonResult?.global_match || null));
 app.get("/result/wix", (req, res) => res.json(lastPythonResult?.wix_match || null));
 
-/**
- * =========================
- * Lancement serveur
- * =========================
- */
+// =========================
+// Lancement serveur
+// =========================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Node API démarrée sur le port ${PORT}`));
