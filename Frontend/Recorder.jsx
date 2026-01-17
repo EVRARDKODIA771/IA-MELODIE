@@ -1,27 +1,32 @@
-import { useRef, useState } from "react";
+import { useRef, useState, useEffect } from "react";
 import "./Recorder.css";
-import { useEffect } from "react";
-
-useEffect(() => {
-  const pingBackend = async () => {
-    try {
-      await fetch("https://ia-melodie.onrender.com/ping");
-    } catch (err) {
-      console.error("Ping backend failed", err);
-    }
-  };
-
-  // Ping immédiat au chargement
-  pingBackend();
-
-  // Ping toutes les 5 minutes
-  const interval = setInterval(pingBackend, 5 * 60 * 1000);
-
-  // Cleanup à la destruction du composant
-  return () => clearInterval(interval);
-}, []);
 
 export default function Recorder() {
+  // ======================
+  // ANTI-SOMMEIL / PING BACKEND
+  // ======================
+  useEffect(() => {
+    const pingBackend = async () => {
+      try {
+        await fetch("https://ia-melodie.onrender.com/ping");
+      } catch (err) {
+        console.error("Ping backend failed", err);
+      }
+    };
+
+    // Ping immédiat au chargement
+    pingBackend();
+
+    // Ping toutes les 5 minutes
+    const interval = setInterval(pingBackend, 5 * 60 * 1000);
+
+    // Cleanup
+    return () => clearInterval(interval);
+  }, []);
+
+  // ======================
+  // RECORDER STATES
+  // ======================
   const mediaRecorderRef = useRef(null);
   const chunksRef = useRef([]);
   const timerRef = useRef(null);
@@ -33,7 +38,6 @@ export default function Recorder() {
   const [status, setStatus] = useState("Touchez le micro pour chanter");
   const [result, setResult] = useState(null);
 
-  // Format mm:ss
   const formatTime = (s) =>
     `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 
@@ -47,7 +51,7 @@ export default function Recorder() {
     mediaRecorderRef.current = recorder;
     chunksRef.current = [];
 
-    recorder.ondataavailable = e => chunksRef.current.push(e.data);
+    recorder.ondataavailable = (e) => chunksRef.current.push(e.data);
     recorder.onstop = () => {
       const blob = new Blob(chunksRef.current, { type: "audio/webm" });
       setAudioBlob(blob);
@@ -59,7 +63,7 @@ export default function Recorder() {
     setTime(0);
     setStatus("🎶 Enregistrement en cours...");
 
-    timerRef.current = setInterval(() => setTime(t => t + 1), 1000);
+    timerRef.current = setInterval(() => setTime((t) => t + 1), 1000);
   };
 
   // ======================
@@ -77,7 +81,7 @@ export default function Recorder() {
       mediaRecorderRef.current.resume();
       setIsPaused(false);
       setStatus("🎶 Enregistrement en cours...");
-      timerRef.current = setInterval(() => setTime(t => t + 1), 1000);
+      timerRef.current = setInterval(() => setTime((t) => t + 1), 1000);
     }
   };
 
@@ -87,7 +91,7 @@ export default function Recorder() {
   const stopRecording = () => {
     if (!mediaRecorderRef.current) return;
     mediaRecorderRef.current.stop();
-    mediaRecorderRef.current.stream.getTracks().forEach(t => t.stop());
+    mediaRecorderRef.current.stream.getTracks().forEach((t) => t.stop());
     clearInterval(timerRef.current);
     setIsRecording(false);
     setStatus("🧠 Prêt pour l’analyse");
@@ -105,10 +109,13 @@ export default function Recorder() {
     formData.append("file", audioBlob, "recording.webm");
 
     try {
-      const res = await fetch("https://ia-melodie.onrender.com/melody/upload?backend=audd", {
-        method: "POST",
-        body: formData
-      });
+      const res = await fetch(
+        "https://ia-melodie.onrender.com/melody/upload?backend=audd",
+        {
+          method: "POST",
+          body: formData,
+        }
+      );
 
       if (!res.ok) throw new Error("Erreur serveur");
 
@@ -162,9 +169,7 @@ export default function Recorder() {
       )}
 
       {/* RESULT */}
-      {result && (
-        <pre className="result">{JSON.stringify(result, null, 2)}</pre>
-      )}
+      {result && <pre className="result">{JSON.stringify(result, null, 2)}</pre>}
     </div>
   );
 }
