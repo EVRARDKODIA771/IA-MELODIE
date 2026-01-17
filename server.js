@@ -3,7 +3,7 @@ import multer from "multer";
 import fs from "fs";
 import { spawn } from "child_process";
 import path from "path";
-import fetch from "node-fetch"; // fetch corrigé
+import fetch from "node-fetch";
 import FormData from "form-data";
 import cors from "cors";
 
@@ -13,43 +13,50 @@ const app = express();
 // Activer CORS pour le frontend
 // =========================
 app.use(cors({
-  origin: ["https://ia-melodie-1.onrender.com", "http://localhost:5173"], // frontend prod + dev
+  origin: ["https://ia-melodie-1.onrender.com", "http://localhost:5173"],
   methods: ["GET","POST","OPTIONS"],
   allowedHeaders: ["Content-Type"]
 }));
 
 // =========================
-// Ping backend pour le réveil
+// Pour parser JSON et form-data simples
+// =========================
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// =========================
+// Ping backend
 // =========================
 app.get("/ping", (req, res) => {
   res.json({ status: "ok", message: "Backend awake" });
 });
 
 // =========================
-// Configuration upload
+// Config upload
 // =========================
 const upload = multer({ dest: "/tmp" });
 const API_TOKEN = "3523e792bbced184caa4f51a33a2494a";
 const pythonPath = path.join(process.cwd(), "app.py");
 
 // =========================
-// Stockage des résultats
+// Stockage des résultats par JobID
 // =========================
-let lastPythonResult = null;
-let lastAuddResult = null;
+const resultsByJobId = {};
 
 // =========================
-// Endpoint upload
-// pipeline=python|audd
+// Upload audio et traitement
 // =========================
 app.post("/melody/upload", upload.single("file"), async (req, res) => {
-  if (!req.file) return res.status(400).json({ status: "error", message: "No file" });
+  const { jobId } = req.body;
+  const backend = req.query.backend || "python";
 
-  const backend = req.query.backend || "python"; // par défaut Python
+  if (!req.file) return res.status(400).json({ status: "error", message: "No file" });
+  if (!jobId) return res.status(400).json({ status: "error", message: "JobID manquant" });
+
   const filePath = req.file.path;
 
   if (backend === "audd") {
-    // Pipeline AUdD
+    // AUdD pipeline
     const formData = new FormData();
     formData.append("api_token", API_TOKEN);
     formData.append("file", fs.createReadStream(filePath));
@@ -58,16 +65,19 @@ app.post("/melody/upload", upload.single("file"), async (req, res) => {
     try {
       const response = await fetch("https://api.audd.io/", { method: "POST", body: formData });
       const data = await response.json();
-      lastAuddResult = data.result;
+
+      // Stockage du résultat par JobID
+      resultsByJobId[jobId] = data.result;
+
       fs.unlink(filePath, () => {});
-      return res.json({ status: "ok", result: lastAuddResult });
+      return res.json({ status: "ok", jobId, message: "Upload reçu, résultat disponible sur /melody/result/:jobId" });
     } catch (err) {
       console.error(err);
       fs.unlink(filePath, () => {});
       return res.status(500).json({ status: "error", message: "AUdD API error" });
     }
   } else {
-    // Pipeline Python
+    // Python pipeline
     console.log("📥 Audio reçu (Python) :", req.file.originalname);
 
     const python = spawn("python3", [pythonPath, filePath]);
@@ -87,8 +97,9 @@ app.post("/melody/upload", upload.single("file"), async (req, res) => {
       }
 
       try {
-        lastPythonResult = JSON.parse(stdoutData);
-        return res.json({ status: "ok", result: lastPythonResult });
+        const parsed = JSON.parse(stdoutData);
+        resultsByJobId[jobId] = parsed; // stocke le résultat par JobID
+        return res.json({ status: "ok", jobId, message: "Upload reçu, résultat disponible sur /melody/result/:jobId" });
       } catch (err) {
         console.error("❌ JSON invalide retourné par Python :", stdoutData);
         return res.status(500).json({ status: "error", message: "Réponse Python invalide" });
@@ -98,26 +109,18 @@ app.post("/melody/upload", upload.single("file"), async (req, res) => {
 });
 
 // =========================
-// Récupérer dernier résultat complet
-// ?backend=python|audd
+// Récupérer résultat par JobID
 // =========================
-app.get("/melody/result", (req, res) => {
-  const backend = req.query.backend || "python";
-  if (backend === "audd") {
-    if (!lastAuddResult) return res.status(404).json({ status: "error", message: "Aucun résultat AUdD disponible" });
-    return res.json(lastAuddResult);
-  } else {
-    if (!lastPythonResult) return res.status(404).json({ status: "error", message: "Aucun résultat Python disponible" });
-    return res.json(lastPythonResult);
-  }
-});
+app.get("/melody/result/:jobId", (req, res) => {
+  const { jobId } = req.params;
 
-// =========================
-// Endpoints legacy Wix (Python uniquement)
-// =========================
-app.get("/result/lyrics", (req, res) => res.json(lastPythonResult?.lyrics || null));
-app.get("/result/global", (req, res) => res.json(lastPythonResult?.global_match || null));
-app.get("/result/wix", (req, res) => res.json(lastPythonResult?.wix_match || null));
+  if (!jobId) return res.status(400).json({ status: "error", message: "JobID manquant" });
+
+  const result = resultsByJobId[jobId];
+  if (!result) return res.status(404).json({ status: "error", message: "Résultat non trouvé pour ce JobID" });
+
+  return res.json(result);
+});
 
 // =========================
 // Lancement serveur
