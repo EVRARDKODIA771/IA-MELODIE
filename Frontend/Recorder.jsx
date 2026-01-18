@@ -6,25 +6,30 @@ import "./Recorder.css";
 // ======================
 const backendUrl = import.meta.env.VITE_BACKEND_URL;
 
-// Fonction utilitaire pour générer un JobID unique
-const generateJobId = () => "job-" + Math.random().toString(36).substr(2, 9);
-
 export default function Recorder() {
+
+  // ======================
+  // PARAMÈTRES REÇUS DE WIX
+  // ======================
+  const urlParams = new URLSearchParams(window.location.search);
+  const jobId = urlParams.get("jobId");
+  const userId = urlParams.get("user");
+  const returnUrl = urlParams.get("returnUrl");
+
+  // Sécurité minimale
+  if (!jobId || !userId || !returnUrl) {
+    return (
+      <div style={{ padding: 20 }}>
+        ❌ Paramètres manquants (jobId / user / returnUrl)
+      </div>
+    );
+  }
+
   // ======================
   // ANTI-SOMMEIL / PING BACKEND
   // ======================
   useEffect(() => {
-    const pingBackend = async () => {
-      try {
-        await fetch(`${backendUrl}/ping`);
-      } catch (err) {
-        console.error("Ping backend failed", err);
-      }
-    };
-
-    pingBackend();
-    const interval = setInterval(pingBackend, 5 * 60 * 1000);
-    return () => clearInterval(interval);
+    fetch(`${backendUrl}/ping`).catch(() => {});
   }, []);
 
   // ======================
@@ -36,21 +41,14 @@ export default function Recorder() {
 
   const [isRecording, setIsRecording] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
-  const [audioBlob, setAudioBlob] = useState(null);
   const [time, setTime] = useState(0);
   const [status, setStatus] = useState("Touchez le micro pour chanter");
-  const [result, setResult] = useState(null);
-  const [jobId, setJobId] = useState(null);
-
-  // Récupérer returnUrl depuis query param
-  const urlParams = new URLSearchParams(window.location.search);
-  const returnUrl = urlParams.get("returnUrl");
 
   const formatTime = (s) =>
     `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 
   // ======================
-  // START RECORDING (auto stop 7s)
+  // START RECORDING
   // ======================
   const startRecording = async () => {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -58,18 +56,13 @@ export default function Recorder() {
 
     mediaRecorderRef.current = recorder;
     chunksRef.current = [];
-    setAudioBlob(null);
-    setResult(null);
-
-    const newJobId = generateJobId();
-    setJobId(newJobId);
 
     recorder.ondataavailable = (e) => chunksRef.current.push(e.data);
-    recorder.onstop = () => {
+
+    recorder.onstop = async () => {
       const blob = new Blob(chunksRef.current, { type: "audio/webm" });
-      setAudioBlob(blob);
-      setStatus("🧠 Enregistrement terminé, envoi au serveur...");
-      sendAudio(blob, newJobId);
+      setStatus("🧠 Envoi au serveur...");
+      await sendAudio(blob);
     };
 
     recorder.start();
@@ -78,34 +71,9 @@ export default function Recorder() {
     setTime(0);
     setStatus("🎶 Enregistrement en cours...");
 
-    // Timer
-    timerRef.current = setInterval(() => setTime((t) => t + 1), 1000);
+    timerRef.current = setInterval(() => setTime(t => t + 1), 1000);
 
-    // Auto-stop après 7 secondes
-    setTimeout(() => {
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
-        stopRecording();
-      }
-    }, 7000);
-  };
-
-  // ======================
-  // PAUSE / RESUME
-  // ======================
-  const togglePause = () => {
-    if (!mediaRecorderRef.current) return;
-
-    if (mediaRecorderRef.current.state === "recording") {
-      mediaRecorderRef.current.pause();
-      setIsPaused(true);
-      setStatus("⏸️ En pause");
-      clearInterval(timerRef.current);
-    } else {
-      mediaRecorderRef.current.resume();
-      setIsPaused(false);
-      setStatus("🎶 Enregistrement en cours...");
-      timerRef.current = setInterval(() => setTime((t) => t + 1), 1000);
-    }
+    setTimeout(stopRecording, 7000);
   };
 
   // ======================
@@ -114,20 +82,39 @@ export default function Recorder() {
   const stopRecording = () => {
     if (!mediaRecorderRef.current) return;
     mediaRecorderRef.current.stop();
-    mediaRecorderRef.current.stream.getTracks().forEach((t) => t.stop());
+    mediaRecorderRef.current.stream.getTracks().forEach(t => t.stop());
     clearInterval(timerRef.current);
     setIsRecording(false);
   };
 
   // ======================
-  // SEND AUDIO AUdD
+  // PAUSE / RESUME
   // ======================
-  const sendAudio = async (blob, jobId) => {
-    if (!blob || !jobId) return;
+  const togglePause = () => {
+    const rec = mediaRecorderRef.current;
+    if (!rec) return;
 
+    if (rec.state === "recording") {
+      rec.pause();
+      setIsPaused(true);
+      setStatus("⏸️ En pause");
+      clearInterval(timerRef.current);
+    } else {
+      rec.resume();
+      setIsPaused(false);
+      setStatus("🎶 Enregistrement en cours...");
+      timerRef.current = setInterval(() => setTime(t => t + 1), 1000);
+    }
+  };
+
+  // ======================
+  // SEND AUDIO → BACKEND
+  // ======================
+  const sendAudio = async (blob) => {
     const formData = new FormData();
     formData.append("file", blob, "recording.webm");
     formData.append("jobId", jobId);
+    formData.append("user", userId);
 
     try {
       const res = await fetch(`${backendUrl}/melody/upload?backend=audd`, {
@@ -137,24 +124,16 @@ export default function Recorder() {
 
       if (!res.ok) throw new Error("Erreur serveur");
 
-      const resultUrl = `${backendUrl}/melody/result/${jobId}?backend=audd`;
-      setStatus(`✅ Musique envoyée !`);
-
-      setResult({ jobId, resultUrl });
+      setStatus("✅ Identification terminée, retour vers Wix...");
 
       // ======================
-      // REDIRECTION WIX AVEC JOBID ET RESULTURL
+      // RETOUR EXACT VERS WIX
       // ======================
-      if (returnUrl) {
-        try {
-          const wixUrl = new URL(decodeURIComponent(returnUrl));
-          wixUrl.searchParams.set("jobId", jobId);
-          wixUrl.searchParams.set("resultUrl", resultUrl);
-          window.location.href = wixUrl.toString();
-        } catch (err) {
-          console.error("Erreur parsing returnUrl Wix :", err);
-        }
-      }
+      const wixUrl = new URL(decodeURIComponent(returnUrl));
+      wixUrl.searchParams.set("jobId", jobId);
+      wixUrl.searchParams.set("user", userId);
+
+      window.location.href = wixUrl.toString();
 
     } catch (err) {
       console.error(err);
@@ -170,7 +149,6 @@ export default function Recorder() {
       <div className="title">PARTITION MANAGER</div>
       <div className="subtitle">Chantez ou fredonnez une musique</div>
 
-      {/* SHAZAM CIRCLE */}
       <div
         className="pulse-wrapper"
         onClick={!isRecording ? startRecording : stopRecording}
@@ -180,31 +158,14 @@ export default function Recorder() {
         <div className="center-circle">🎤</div>
       </div>
 
-      {/* TIMER */}
       <div className="time">{formatTime(time)}</div>
-
-      {/* STATUS */}
       <div className="status">{status}</div>
 
-      {/* CONTROLS */}
       {isRecording && (
         <div className="buttons">
           <button onClick={togglePause}>
             {isPaused ? "▶️ Reprendre" : "⏸️ Pause"}
           </button>
-        </div>
-      )}
-
-      {/* RESULT */}
-      {result && (
-        <div className="result">
-          <p>JobID : {result.jobId}</p>
-          <p>
-            Récupérer le résultat via :{" "}
-            <a href={result.resultUrl} target="_blank" rel="noopener noreferrer">
-              {result.resultUrl}
-            </a>
-          </p>
         </div>
       )}
     </div>
