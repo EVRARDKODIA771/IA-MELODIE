@@ -50,10 +50,46 @@ const API_TOKEN = "3523e792bbced184caa4f51a33a2494a";
 const resultsByJobId = Object.create(null);
 
 // =========================
+// ✅ AJOUT : Persistence /tmp (anti "JobID inconnu")
+// =========================
+function jobFilePath(jobId) {
+  return `/tmp/fpjob-${jobId}.json`;
+}
+
+function saveJob(jobId) {
+  try {
+    const job = resultsByJobId[jobId];
+    if (!job) return;
+    fs.writeFileSync(jobFilePath(jobId), JSON.stringify(job), "utf-8");
+  } catch (e) {
+    console.error("❌ saveJob failed:", e.message);
+  }
+}
+
+function loadJob(jobId) {
+  try {
+    const p = jobFilePath(jobId);
+    if (!fs.existsSync(p)) return null;
+    const raw = fs.readFileSync(p, "utf-8");
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error("❌ loadJob failed:", e.message);
+    return null;
+  }
+}
+
+// =========================
 // Utils
 // =========================
 function ensureJob(jobId) {
   if (!resultsByJobId[jobId]) {
+    // ✅ AJOUT : tente de restaurer depuis /tmp si RAM vide (restart render)
+    const restored = loadJob(jobId);
+    if (restored) {
+      resultsByJobId[jobId] = restored;
+      return resultsByJobId[jobId];
+    }
+
     resultsByJobId[jobId] = {
       status: "pending",
       result: null,
@@ -61,6 +97,7 @@ function ensureJob(jobId) {
       logs: [],
       createdAt: Date.now(),
     };
+    saveJob(jobId); // ✅ AJOUT
   }
   return resultsByJobId[jobId];
 }
@@ -72,6 +109,7 @@ function pushLog(jobId, line) {
   // éviter explosion mémoire
   if (job.logs.length > 500) job.logs.shift();
   console.log(`🧾 [${jobId}] ${line}`);
+  saveJob(jobId); // ✅ AJOUT
 }
 
 async function downloadToFile(url, destPath, jobId) {
@@ -167,6 +205,7 @@ app.post("/melody/upload", upload.single("file"), async (req, res) => {
       ensureJob(jobId);
       resultsByJobId[jobId].status = "done";
       resultsByJobId[jobId].result = data.result;
+      saveJob(jobId); // ✅ AJOUT
 
       fs.unlink(filePath, () => {});
       return res.json({ status: "ok", jobId, message: "Upload reçu, résultat disponible sur /melody/result/:jobId" });
@@ -201,6 +240,7 @@ app.post("/melody/upload", upload.single("file"), async (req, res) => {
         ensureJob(jobId);
         resultsByJobId[jobId].status = "done";
         resultsByJobId[jobId].result = parsed;
+        saveJob(jobId); // ✅ AJOUT
 
         return res.json({ status: "ok", jobId, message: "Upload reçu, résultat disponible sur /melody/result/:jobId" });
       } catch (err) {
@@ -215,9 +255,11 @@ app.get("/melody/result/:jobId", (req, res) => {
   const { jobId } = req.params;
   if (!jobId) return res.status(400).json({ status: "error", message: "JobID manquant" });
 
-  const job = resultsByJobId[jobId];
+  // ✅ AJOUT : si RAM vide, tente /tmp
+  const job = resultsByJobId[jobId] || loadJob(jobId);
   if (!job || !job.result) return res.status(404).json({ status: "error", message: "Résultat non trouvé pour ce JobID" });
 
+  resultsByJobId[jobId] = job;
   return res.json(job.result);
 });
 
@@ -257,6 +299,8 @@ app.post("/fingerprint/url", async (req, res) => {
   job.status = "processing";
   job.error = null;
   job.result = null;
+  saveJob(jobId); // ✅ AJOUT
+
   pushLog(jobId, "Job fingerprint démarré (URL).");
 
   const tmpFile = `/tmp/${jobId}.audio`;
@@ -279,11 +323,15 @@ app.post("/fingerprint/url", async (req, res) => {
       const j = ensureJob(jobId);
       j.status = "done";
       j.result = result;
+      j.error = null;
+      saveJob(jobId); // ✅ AJOUT
       pushLog(jobId, "Job fingerprint terminé ✅");
     } catch (err) {
       const j = ensureJob(jobId);
       j.status = "error";
       j.error = err.message || String(err);
+      j.result = null;
+      saveJob(jobId); // ✅ AJOUT
       pushLog(jobId, `Job fingerprint échoué ❌ : ${j.error}`);
     } finally {
       fs.unlink(tmpFile, () => {});
@@ -313,6 +361,7 @@ app.post("/fingerprint/upload", upload.single("file"), async (req, res) => {
   job.status = "processing";
   job.error = null;
   job.result = null;
+  saveJob(jobId); // ✅ AJOUT
   pushLog(jobId, "Job fingerprint démarré (UPLOAD).");
 
   res.json({
@@ -331,11 +380,15 @@ app.post("/fingerprint/upload", upload.single("file"), async (req, res) => {
       const j = ensureJob(jobId);
       j.status = "done";
       j.result = result;
+      j.error = null;
+      saveJob(jobId); // ✅ AJOUT
       pushLog(jobId, "Job fingerprint terminé ✅");
     } catch (err) {
       const j = ensureJob(jobId);
       j.status = "error";
       j.error = err.message || String(err);
+      j.result = null;
+      saveJob(jobId); // ✅ AJOUT
       pushLog(jobId, `Job fingerprint échoué ❌ : ${j.error}`);
     } finally {
       fs.unlink(filePath, () => {});
@@ -348,18 +401,17 @@ app.get("/fingerprint/:jobId", (req, res) => {
   const { jobId } = req.params;
   if (!jobId) return res.status(400).json({ status: "error", message: "JobID missing" });
 
-  const job = resultsByJobId[jobId];
+  // ✅ AJOUT : restore depuis /tmp si RAM vide
+  const job = resultsByJobId[jobId] || loadJob(jobId);
   if (!job) {
     return res.status(404).json({ status: "error", message: "JobID inconnu" });
   }
+  resultsByJobId[jobId] = job;
 
-  // IMPORTANT: ton Wix attend {status:"done", fingerprint: ...} éventuellement.
-  // Ici, on renvoie aussi resultUrl pour qu’il fetch le JSON complet.
   if (job.status === "done") {
     return res.json({
       status: "done",
       jobId,
-      // fingerprint "court" pour affichage rapide
       fingerprint: job.result?.fingerprint || null,
       resultUrl: `/fingerprint/result/${jobId}`,
     });
@@ -375,7 +427,7 @@ app.get("/fingerprint/:jobId", (req, res) => {
   }
 
   return res.json({
-    status: job.status, // pending/processing
+    status: job.status,
     jobId,
     resultUrl: `/fingerprint/result/${jobId}`,
   });
@@ -386,14 +438,16 @@ app.get("/fingerprint/result/:jobId", (req, res) => {
   const { jobId } = req.params;
   if (!jobId) return res.status(400).json({ status: "error", message: "JobID missing" });
 
-  const job = resultsByJobId[jobId];
+  // ✅ AJOUT : restore depuis /tmp si RAM vide
+  const job = resultsByJobId[jobId] || loadJob(jobId);
   if (!job) return res.status(404).json({ status: "error", message: "JobID inconnu" });
+  resultsByJobId[jobId] = job;
 
   if (job.status === "done") {
     return res.json({
       status: "done",
       jobId,
-      ...job.result, // contient fingerprint + meta
+      ...job.result,
     });
   }
 
@@ -402,7 +456,7 @@ app.get("/fingerprint/result/:jobId", (req, res) => {
       status: "error",
       jobId,
       message: job.error || "Erreur inconnue",
-      logsTail: job.logs.slice(-30),
+      logsTail: (job.logs || []).slice(-30),
     });
   }
 
@@ -416,9 +470,11 @@ app.get("/fingerprint/result/:jobId", (req, res) => {
 // (Optionnel) logs consultables (debug)
 app.get("/fingerprint/logs/:jobId", (req, res) => {
   const { jobId } = req.params;
-  const job = resultsByJobId[jobId];
+  const job = resultsByJobId[jobId] || loadJob(jobId); // ✅ AJOUT
   if (!job) return res.status(404).json({ status: "error", message: "JobID inconnu" });
-  return res.json({ status: "ok", jobId, logs: job.logs });
+
+  resultsByJobId[jobId] = job;
+  return res.json({ status: "ok", jobId, logs: job.logs || [] });
 });
 
 // =========================
