@@ -1,0 +1,101 @@
+body {
+  margin: 0;
+  background: radial-gradient(circle at top, #0a1a2f, #000);
+  color: white;
+}
+
+.recorder-container {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  font-family: system-ui, sans-serif;
+  text-align: center;
+}
+
+.title {
+  font-size: 2rem;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.subtitle {
+  opacity: 0.7;
+  margin-bottom: 30px;
+}
+
+/* === SHAZAM CIRCLE === */
+.pulse-wrapper {
+  position: relative;
+  width: 220px;
+  height: 220px;
+  margin-bottom: 20px;
+}
+
+.pulse {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: rgba(0, 150, 255, 0.15);
+  animation: pulse 2s infinite;
+}
+
+.pulse.delay {
+  animation-delay: 1s;
+}
+
+.center-circle {
+  position: absolute;
+  inset: 50px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #1db9ff, #0066ff);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  font-size: 3rem;
+  cursor: pointer;
+  box-shadow: 0 0 30px rgba(0,150,255,.6);
+}
+
+@keyframes pulse {
+  0% { transform: scale(1); opacity: .6; }
+  100% { transform: scale(1.6); opacity: 0; }
+}
+
+/* === TIMER === */
+.time {
+  font-size: 2.5rem;
+  font-weight: bold;
+  margin-top: 15px;
+}
+
+/* === STATUS === */
+.status {
+  opacity: 0.8;
+  margin-top: 6px;
+}
+
+/* === RESULT CARD === */
+.result {
+  margin-top: 25px;
+  background: #111;
+  padding: 16px;
+  border-radius: 12px;
+  width: 90%;
+  max-width: 420px;
+  text-align: left;
+  font-size: .85rem;
+}
+
+/* === BUTTON === */
+.send {
+  margin-top: 15px;
+  padding: 14px 22px;
+  font-size: 1rem;
+  border-radius: 30px;
+  border: none;
+  background: #00aaff;
+  color: white;
+  cursor: pointer;
+}
