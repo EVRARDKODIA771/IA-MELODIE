@@ -16,6 +16,13 @@
     "morgan": "^1.10.0",
     "helmet": "^7.1.0",
     "compression": "^1.7.4",
-    "pino": "^9.0.0"
+    "pino": "^9.0.0",
+
+    // 🔥 AJOUTS POUR MATCHING & AUDIO PIPELINE
+    "ml-distance": "^4.0.0",        // distances (euclidienne, cosine, etc.)
+    "lodash": "^4.17.21",           // utilitaires (normalisation, tri, etc.)
+    "uuid": "^9.0.1",               // ids internes si besoin
+    "tmp": "^0.2.1",                // gestion fichiers temporaires propre
+    "streamifier": "^0.1.1"         // pour convertir buffer -> stream si besoin
   }
 }
