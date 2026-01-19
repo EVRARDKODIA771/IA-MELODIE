@@ -23,6 +23,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     zlib1g-dev \
     libjpeg-dev \
+    \
+    # ✅ AJOUTS utiles audio / robustesse
+    mediainfo \
+    libmagic1 \
+    \
     && rm -rf /var/lib/apt/lists/*
 
 # Copier package.json et installer Node deps
@@ -34,6 +39,10 @@ COPY requirements.txt .
 
 # Upgrade pip tooling (ajout)
 RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel
+
+# ✅ AJOUT IMPORTANT: forcer setuptools <81 (stabilité librosa / fin du warning pkg_resources)
+# (ça "écrase" l'upgrade précédent sans supprimer ta ligne)
+RUN pip3 install --no-cache-dir "setuptools<81"
 
 # Installer Torch via wheel précompilé pour éviter build (tu l'avais déjà)
 RUN pip3 install --no-cache-dir torch==2.1.0 --index-url https://download.pytorch.org/whl/cpu
@@ -55,7 +64,12 @@ RUN pip3 install --no-cache-dir \
     audioread \
     pydub \
     matplotlib \
-    scikit-learn
+    scikit-learn \
+    \
+    # ✅ AJOUTS pour le fredonnement / matching
+    fastdtw \
+    tqdm \
+    llvmlite
 
 # Copier tout le projet
 COPY . .
