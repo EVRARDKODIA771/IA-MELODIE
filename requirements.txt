@@ -6,3 +6,12 @@ librosa==0.10.1
 soundfile==0.12.1
 torch==2.1.0
 crepe==0.0.16
+
+# AJOUTS (sans rien supprimer)
+audioread
+numba
+resampy
+pydub
+matplotlib
+scikit-learn
+tqdm
