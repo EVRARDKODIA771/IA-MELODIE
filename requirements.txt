@@ -15,3 +15,8 @@ pydub
 matplotlib
 scikit-learn
 tqdm
+
+# 🔥 AJOUTS POUR FREDONNEMENT / DTW / STABILITÉ
+fastdtw          # comparaison mélodique (Dynamic Time Warping)
+setuptools<81    # évite le warning pkg_resources + compat librosa
+llvmlite         # backend de numba (souvent requis explicitement)
