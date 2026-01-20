@@ -4,9 +4,14 @@ import json
 import hashlib
 import time
 import traceback
+import os
+import tempfile
+import subprocess
 
+# ----------------------------
+# Logging: stderr only
+# ----------------------------
 def log(msg: str):
-    # logs continus pour server.js (stderr)
     sys.stderr.write(msg + "\n")
     sys.stderr.flush()
 
@@ -21,22 +26,85 @@ def _safe_float(x, default=0.0):
     except Exception:
         return float(default)
 
+# ----------------------------
+# stdout JSON only helpers
+# ----------------------------
+def ok(payload: dict, code: int = 0):
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False))
+    sys.stdout.flush()
+    return code
+
+def fail(msg: str, *, code: int = 1, extra: dict | None = None):
+    payload = {"ok": False, "error": msg}
+    if extra:
+        payload["extra"] = extra
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False))
+    sys.stdout.flush()
+    return code
+
+# ============================================================
+# 0) Convert input audio to WAV (handles webm/opus from MediaRecorder)
+# ============================================================
+def convert_to_wav(input_path: str, target_sr: int = 22050) -> str | None:
+    """
+    Returns path to a temporary wav file, or None if conversion fails.
+    Needs ffmpeg.
+    """
+    out_path = tempfile.mktemp(suffix=".wav")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        input_path,
+        "-ac",
+        "1",
+        "-ar",
+        str(target_sr),
+        out_path,
+    ]
+    try:
+        log(f"[fingerprint.py] ffmpeg convert -> wav: {' '.join(cmd)}")
+        subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            return out_path
+        return None
+    except FileNotFoundError:
+        log("[fingerprint.py] ffmpeg not found on system.")
+        try:
+            if os.path.exists(out_path):
+                os.unlink(out_path)
+        except Exception:
+            pass
+        return None
+    except subprocess.CalledProcessError as e:
+        log("[fingerprint.py] ffmpeg failed:")
+        try:
+            log(e.output.decode("utf-8", errors="ignore")[-2000:])
+        except Exception:
+            pass
+        try:
+            if os.path.exists(out_path):
+                os.unlink(out_path)
+        except Exception:
+            pass
+        return None
+
 # ============================================================
 # 1) MATCH SIGNATURE (polyphonique) : chroma SEQUENCE compressée
-#    - robuste: chorale, voix+instruments, tempo différent (DTW côté Node)
 # ============================================================
 def build_chroma_match_signature(y, sr, *, hop_length=512, frames_per_sec=4, max_seconds=30):
     """
     Retour:
-      match_sig_flat: list[int]  (int8 0..127) de taille T*12
+      match_sig_flat: list[int]  (uint8 0..127) de taille T*12
       match_shape: [T,12]
       match_meta: dict
     """
     import numpy as np
     import librosa
 
-    # Option: limiter durée pour réduire coût CPU (Render)
-    # DTW marche mieux si on prend un "extrait" cohérent.
     if max_seconds and max_seconds > 0:
         max_len = int(sr * max_seconds)
         if y.size > max_len:
@@ -44,48 +112,33 @@ def build_chroma_match_signature(y, sr, *, hop_length=512, frames_per_sec=4, max
 
     log("[fingerprint.py] Computing chroma (match signature)...")
 
-    # Chroma CQT: plus robuste aux variations de timbre
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)  # (12, T)
-
     if chroma is None or chroma.size == 0:
         return [], [0, 12], {"match_ok": False, "reason": "empty_chroma"}
 
-    # Normaliser par frame (évite dépendance au volume)
     eps = 1e-9
     chroma = chroma.astype(np.float32)
-    chroma = chroma / (np.sum(chroma, axis=0, keepdims=True) + eps)  # each column sums ~1
+    chroma = chroma / (np.sum(chroma, axis=0, keepdims=True) + eps)
 
-    # Downsample en temps pour avoir ~frames_per_sec
-    # fps_actuel = sr / hop_length / ??? (librosa gives frames per hop)
     fps_actual = sr / hop_length
-    target_fps = float(frames_per_sec)
-    if target_fps <= 0:
-        target_fps = 4.0
-
-    step = int(max(1, round(fps_actual / target_fps)))  # prendre 1 frame sur 'step'
+    target_fps = float(frames_per_sec) if frames_per_sec and frames_per_sec > 0 else 4.0
+    step = int(max(1, round(fps_actual / target_fps)))
     chroma_ds = chroma[:, ::step]  # (12, T2)
 
-    # Limiter T pour éviter payload énorme
-    # (ex: 30s * 4fps = 120 frames)
     T = chroma_ds.shape[1]
     if T == 0:
         return [], [0, 12], {"match_ok": False, "reason": "downsampled_empty"}
 
-    # Quantifier en int8 [0..127]
     q = np.clip(np.round(chroma_ds * 127.0), 0, 127).astype(np.uint8)  # (12, T)
-
-    # Format: T x 12 (plus simple côté Node)
     q_T12 = q.T  # (T, 12)
     flat = q_T12.reshape(-1)  # (T*12,)
 
-    # Hash lisible (optionnel)
     match_hash = sha256_hex(flat.tobytes())
-
     meta = {
         "match_ok": True,
         "type": "chroma_cqt_seq_v1",
         "hop_length": int(hop_length),
-        "frames_per_sec": float(frames_per_sec),
+        "frames_per_sec": float(target_fps),
         "max_seconds": float(max_seconds),
         "T": int(T),
         "quant_scale": 127.0,
@@ -95,8 +148,6 @@ def build_chroma_match_signature(y, sr, *, hop_length=512, frames_per_sec=4, max
 
 # ============================================================
 # 2) MELODY SIGNATURE (monophonique) : pitch intervals (pyin)
-#    - utile surtout si chant SOLO clair
-#    - pour chorale: souvent instable => on garde mais on flag melody_ok
 # ============================================================
 def build_melody_signature(y, sr, *, hop_length=512, n_points=120, max_seconds=20):
     import numpy as np
@@ -107,8 +158,8 @@ def build_melody_signature(y, sr, *, hop_length=512, n_points=120, max_seconds=2
         if y.size > max_len:
             y = y[:max_len]
 
-    fmin = librosa.note_to_hz("C2")  # ~65 Hz
-    fmax = librosa.note_to_hz("C6")  # ~1046 Hz
+    fmin = librosa.note_to_hz("C2")
+    fmax = librosa.note_to_hz("C6")
 
     log("[fingerprint.py] Extracting melody (pyin)...")
     f0, voiced_flag, voiced_prob = librosa.pyin(
@@ -122,8 +173,7 @@ def build_melody_signature(y, sr, *, hop_length=512, n_points=120, max_seconds=2
     if f0 is None:
         return [], {"melody_ok": False, "reason": "pyin_returned_none"}
 
-    midi = librosa.hz_to_midi(f0)  # NaN remains NaN
-
+    midi = librosa.hz_to_midi(f0)
     voiced = np.isfinite(midi)
     voiced_ratio = float(np.mean(voiced)) if midi.size else 0.0
 
@@ -132,7 +182,6 @@ def build_melody_signature(y, sr, *, hop_length=512, n_points=120, max_seconds=2
 
     midi_v = midi[voiced].astype(np.float32)
 
-    # Smoothing médiane
     if midi_v.size >= 7:
         k = 7
         pad = k // 2
@@ -169,7 +218,6 @@ def build_melody_signature(y, sr, *, hop_length=512, n_points=120, max_seconds=2
         "interval_clip_semitones": 12.0,
         "melody_hash": melody_hash,
     }
-
     return sig.tolist(), melody_meta
 
 # ============================================================
@@ -177,21 +225,31 @@ def build_melody_signature(y, sr, *, hop_length=512, n_points=120, max_seconds=2
 # ============================================================
 def main():
     if len(sys.argv) < 2:
-        print(json.dumps({"error": "missing filePath"}))
-        return 2
+        return fail("missing filePath", code=2)
 
-    file_path = sys.argv[1]
+    input_path = sys.argv[1]
     t0 = time.time()
-    log(f"[fingerprint.py] Start. file={file_path}")
+    log(f"[fingerprint.py] Start. file={input_path}")
 
+    wav_tmp = None
     try:
         import numpy as np
         import librosa
 
-        # 1) Load audio
         target_sr = 22050
+
+        # 0) Convert (best effort)
+        wav_tmp = convert_to_wav(input_path, target_sr=target_sr)
+        load_path = wav_tmp or input_path
+        if wav_tmp:
+            log(f"[fingerprint.py] Using converted wav: {wav_tmp}")
+        else:
+            log("[fingerprint.py] Using original file (no conversion). This may fail for webm/opus.")
+
+        # 1) Load audio
         log("[fingerprint.py] Loading audio...")
-        y, sr = librosa.load(file_path, sr=target_sr, mono=True)
+        y, sr = librosa.load(load_path, sr=target_sr, mono=True)
+
         duration = float(librosa.get_duration(y=y, sr=sr))
         log(f"[fingerprint.py] Loaded. sr={sr}, samples={len(y)}, duration={duration:.2f}s")
 
@@ -203,7 +261,7 @@ def main():
         y = y.astype(np.float32)
         y = y / (np.max(np.abs(y)) + eps)
 
-        # 3) Features (ton fingerprint actuel)
+        # 3) Features fingerprint "global"
         log("[fingerprint.py] Computing chroma...")
         chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
 
@@ -237,15 +295,15 @@ def main():
         fingerprint = sha256_hex(q.tobytes())
         short_fp = fingerprint[:16]
 
-        # 4) ✅ MATCH signature (polyphonique) pour comparaison (chorale + solo + musique)
+        # 4) MATCH signature (polyphonique)
         match_sig, match_shape, match_meta = build_chroma_match_signature(
             y, sr,
             hop_length=512,
-            frames_per_sec=4,   # ~4 fps => ~120 frames pour 30s
+            frames_per_sec=4,
             max_seconds=30
         )
 
-        # 5) ✅ Melody signature (monophonique) (utile surtout solo)
+        # 5) Melody signature (mono)
         melody_sig, melody_meta = build_melody_signature(
             y, sr,
             hop_length=512,
@@ -257,6 +315,7 @@ def main():
         log(f"[fingerprint.py] Done in {elapsed:.2f}s. fingerprint={short_fp}...")
 
         out = {
+            "ok": True,
             "fingerprint": fingerprint,
             "fingerprint_short": short_fp,
             "meta": {
@@ -264,31 +323,38 @@ def main():
                 "duration_sec": duration,
                 "tempo_bpm_est": tempo,
                 "vector_dim": int(q.shape[0]),
-                "quant_scale": 1000.0
+                "quant_scale": 1000.0,
+                "used_ffmpeg_wav": bool(wav_tmp),
             },
-
-            # ✅ signature polyphonique comparable (DTW côté Node)
             "match": {
-                "shape": match_shape,        # [T,12]
-                "signature": match_sig,      # flat list length T*12 (uint8)
+                "shape": match_shape,
+                "signature": match_sig,
                 **match_meta
             },
-
-            # ✅ pitch intervals (surtout solo)
             "melody": {
-                "signature": melody_sig,     # list[int] len 120
+                "signature": melody_sig,
                 **melody_meta
             }
         }
 
-        print(json.dumps(out, ensure_ascii=False))
-        return 0
+        return ok(out, code=0)
 
     except Exception as e:
         log("[fingerprint.py] ERROR: " + str(e))
         log(traceback.format_exc())
-        print(json.dumps({"error": str(e)}))
-        return 1
+        return fail(
+            "python_exception",
+            code=1,
+            extra={"type": str(type(e)), "msg": str(e)}
+        )
+
+    finally:
+        if wav_tmp:
+            try:
+                os.unlink(wav_tmp)
+                log(f"[fingerprint.py] Deleted temp wav: {wav_tmp}")
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     sys.exit(main())
