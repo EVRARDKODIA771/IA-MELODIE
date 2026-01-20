@@ -39,7 +39,7 @@ app.use(
       return cb(new Error("Not allowed by CORS: " + origin));
     },
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
   })
 );
 
