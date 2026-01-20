@@ -10,51 +10,69 @@ import { fileURLToPath } from "url";
 import { dirname } from "path";
 import { pipeline } from "stream/promises";
 
+process.on("uncaughtException", (err) => {
+  console.error("💥 uncaughtException:", err);
+});
+process.on("unhandledRejection", (err) => {
+  console.error("💥 unhandledRejection:", err);
+});
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const app = express();
 
 // =========================
-// CORS
-// =========================
-// =========================
 // CORS (Render Front + Wix + Dev)
 // =========================
 const allowedOrigins = new Set([
-  "https://ia-melodie-1.onrender.com",         // ton frontend Render
-  "https://partitionsmanagers.wixstudio.com",  // Wix (important)
-  "http://localhost:5173",                     // dev local (optionnel)
+  "https://ia-melodie-1.onrender.com",
+  "https://partitionsmanagers.wixstudio.com",
+  "http://localhost:5173",
 ]);
 
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      // Certaines requêtes (curl/server-to-server) n'ont pas d'Origin
-      if (!origin) return cb(null, true);
+const corsOptions = {
+  origin: (origin, cb) => {
+    // Requêtes sans Origin (curl, server-to-server)
+    if (!origin) return cb(null, true);
 
-      if (allowedOrigins.has(origin)) return cb(null, true);
+    if (allowedOrigins.has(origin)) return cb(null, true);
 
-      console.error("❌ CORS blocked origin:", origin);
-      return cb(new Error("Not allowed by CORS: " + origin));
-    },
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
-  })
-);
+    console.error("❌ CORS blocked origin:", origin);
+    return cb(new Error("Not allowed by CORS: " + origin));
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+  // important si un jour tu utilises cookies; sinon laisse false
+  credentials: false,
+  maxAge: 86400,
+};
 
-// IMPORTANT : répondre aux preflight OPTIONS
-app.options("*", cors());
+// IMPORTANT : CORS d'abord
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 
+// (optionnel) log toutes les requêtes entrantes (utile Render)
+app.use((req, _res, next) => {
+  console.log(`➡️ ${req.method} ${req.url} | origin=${req.headers.origin || "none"}`);
+  next();
+});
 
-// ⚠️ augmente la limite: candidates peut être volumineux
+// JSON
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 // =========================
 // Upload config
 // =========================
-const upload = multer({ dest: "/tmp" });
+// Limites pour éviter crash / timeouts silencieux
+const upload = multer({
+  dest: "/tmp",
+  limits: {
+    fileSize: 15 * 1024 * 1024, // 15MB (ajuste si besoin)
+  },
+});
+
 const pythonPath = path.join(__dirname, "fingerprint.py");
 const API_TOKEN = "3523e792bbced184caa4f51a33a2494a";
 
@@ -64,7 +82,7 @@ const API_TOKEN = "3523e792bbced184caa4f51a33a2494a";
 const resultsByJobId = Object.create(null);
 
 // =========================
-// ✅ Persistence /tmp (anti "JobID inconnu")
+// Persistence /tmp
 // =========================
 function jobFilePath(jobId) {
   return `/tmp/fpjob-${jobId}.json`;
@@ -92,7 +110,7 @@ function loadJob(jobId) {
   }
 }
 
-// (Optionnel) nettoyage jobs vieux (2h)
+// nettoyage jobs vieux (2h)
 const JOB_TTL_MS = 2 * 60 * 60 * 1000;
 setInterval(() => {
   const now = Date.now();
@@ -118,7 +136,6 @@ function ensureJob(jobId) {
       resultsByJobId[jobId] = restored;
       return resultsByJobId[jobId];
     }
-
     resultsByJobId[jobId] = {
       status: "pending",
       result: null,
@@ -168,7 +185,6 @@ function runPythonFingerprint(filePath, jobId) {
     py.stderr.on("data", (chunk) => {
       const text = chunk.toString();
       stderrBuffer += text;
-
       const lines = text.split(/\r?\n/).filter(Boolean);
       for (const l of lines) pushLog(jobId, `PY: ${l}`);
     });
@@ -198,111 +214,28 @@ function runPythonFingerprint(filePath, jobId) {
 }
 
 // =========================
-// ✅ DTW vectoriel (pour match chroma séquence)
+// DEBUG route: test CORS sans upload
 // =========================
-function reshapeFlatToFrames(signatureFlat, shape) {
-  // shape = [T, 12]
-  if (!Array.isArray(shape) || shape.length !== 2) return null;
-  const T = Number(shape[0]) || 0;
-  const D = Number(shape[1]) || 0;
-  if (T <= 0 || D <= 0) return null;
-  if (!Array.isArray(signatureFlat) || signatureFlat.length !== T * D) return null;
-
-  const frames = new Array(T);
-  for (let t = 0; t < T; t++) {
-    const off = t * D;
-    const v = new Array(D);
-    for (let d = 0; d < D; d++) v[d] = Number(signatureFlat[off + d]) || 0;
-    frames[t] = v;
-  }
-  return frames;
-}
-
-function l1DistanceVec(a, b) {
-  // a,b length 12, ints 0..127
-  const D = Math.min(a.length, b.length);
-  let s = 0;
-  for (let i = 0; i < D; i++) s += Math.abs(a[i] - b[i]);
-  return s;
-}
-
-function dtwDistanceVec(A, B) {
-  const n = A.length;
-  const m = B.length;
-  if (n === 0 || m === 0) return Number.POSITIVE_INFINITY;
-
-  const INF = 1e18;
-  // DP "2 lignes" pour économiser RAM
-  let prev = new Float64Array(m + 1);
-  let cur = new Float64Array(m + 1);
-  for (let j = 0; j <= m; j++) prev[j] = INF;
-  prev[0] = 0;
-
-  for (let i = 1; i <= n; i++) {
-    cur[0] = INF;
-    for (let j = 1; j <= m; j++) {
-      const cost = l1DistanceVec(A[i - 1], B[j - 1]);
-      const bestPrev = Math.min(prev[j], cur[j - 1], prev[j - 1]);
-      cur[j] = cost + bestPrev;
-    }
-    // swap
-    const tmp = prev;
-    prev = cur;
-    cur = tmp;
-  }
-
-  return prev[m];
-}
-
-function matchScoreChroma(qFrames, cFrames) {
-  const dist = dtwDistanceVec(qFrames, cFrames);
-
-  // dist typique ~ (L * 12 * ~20-60) => ça peut être gros
-  // k à tuner: plus grand => scores plus hauts
-  const k = 120000; // bon départ; ajuste selon ton dataset
-  const score = 1 / (1 + dist / k);
-  return Math.max(0, Math.min(1, score));
-}
-
-// =========================
-// ✅ Melody DTW (ancien) : utile si tu veux fallback mono
-// =========================
-function dtwDistanceScalar(a, b) {
-  const n = a.length;
-  const m = b.length;
-  const INF = 1e15;
-
-  const dp = Array.from({ length: n + 1 }, () => new Float64Array(m + 1).fill(INF));
-  dp[0][0] = 0;
-
-  for (let i = 1; i <= n; i++) {
-    for (let j = 1; j <= m; j++) {
-      const cost = Math.abs(a[i - 1] - b[j - 1]);
-      const bestPrev = Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
-      dp[i][j] = cost + bestPrev;
-    }
-  }
-  return dp[n][m];
-}
-
-function melodyScoreIntervals(a, b) {
-  if (!Array.isArray(a) || !Array.isArray(b) || a.length === 0 || b.length === 0) return 0;
-
-  const dist = dtwDistanceScalar(a, b);
-  const k = 2500;
-  const score = 1 / (1 + dist / k);
-  return Math.max(0, Math.min(1, score));
-}
+app.get("/debug/echo", (req, res) => {
+  res.json({
+    ok: true,
+    origin: req.headers.origin || null,
+    ua: req.headers["user-agent"] || null,
+    time: new Date().toISOString(),
+  });
+});
 
 // =========================
 // Ping backend
 // =========================
-app.get("/ping", (req, res) => res.json({ status: "ok", message: "Backend awake" }));
+app.get("/ping", (_req, res) => res.json({ status: "ok", message: "Backend awake" }));
 
 // =========================
-// 1️⃣ Routes Melody (AUdD)
+// 1) Melody (AUdD)
 // =========================
 app.post("/melody/upload", upload.single("file"), async (req, res) => {
+  console.log("✅ HIT /melody/upload", "origin=", req.headers.origin, "jobId=", req.body?.jobId);
+
   const { jobId } = req.body;
   const backend = req.query.backend || "python";
 
@@ -327,9 +260,14 @@ app.post("/melody/upload", upload.single("file"), async (req, res) => {
       saveJob(jobId);
 
       fs.unlink(filePath, () => {});
-      return res.json({ status: "ok", jobId, message: "Upload reçu, résultat dispo sur /melody/result/:jobId" });
+      return res.json({
+        status: "ok",
+        jobId,
+        pollUrl: `/melody/result/${jobId}`,
+        message: "AUdD OK",
+      });
     } catch (err) {
-      console.error(err);
+      console.error("❌ AUdD error:", err);
       fs.unlink(filePath, () => {});
       return res.status(500).json({ status: "error", message: "AUdD API error" });
     }
@@ -356,7 +294,7 @@ app.post("/melody/upload", upload.single("file"), async (req, res) => {
       resultsByJobId[jobId].status = "done";
       resultsByJobId[jobId].result = parsed;
       saveJob(jobId);
-      return res.json({ status: "ok", jobId, message: "Upload reçu, résultat dispo sur /melody/result/:jobId" });
+      return res.json({ status: "ok", jobId, message: "Python OK" });
     } catch {
       console.error("❌ JSON invalide retourné par Python :", stdoutData);
       return res.status(500).json({ status: "error", message: "Réponse Python invalide" });
@@ -376,7 +314,7 @@ app.get("/melody/result/:jobId", (req, res) => {
 });
 
 // =========================
-// 2️⃣ Routes Fingerprint (asynchrones + URL résultat)
+// 2) Fingerprint generic (inchangé)
 // =========================
 app.post("/fingerprint/url", async (req, res) => {
   const { url, jobId } = req.body;
@@ -435,6 +373,8 @@ app.post("/fingerprint/url", async (req, res) => {
 });
 
 app.post("/fingerprint/upload", upload.single("file"), async (req, res) => {
+  console.log("✅ HIT /fingerprint/upload", "origin=", req.headers.origin, "jobId=", req.body?.jobId);
+
   const { jobId } = req.body;
   if (!req.file) return res.status(400).json({ status: "error", message: "No file" });
   if (!jobId) return res.status(400).json({ status: "error", message: "JobID missing" });
@@ -502,7 +442,6 @@ app.get("/fingerprint/:jobId", (req, res) => {
     return res.json({
       status: "done",
       jobId,
-      fingerprint: job.result?.fingerprint || null,
       resultUrl: `/fingerprint/result/${jobId}`,
     });
   }
@@ -565,15 +504,15 @@ app.get("/fingerprint/logs/:jobId", (req, res) => {
 });
 
 // =========================
-// 3️⃣ HUM routes (fredonnement / chorale)
-//    Maintenant on renvoie match + melody (si dispo)
+// 3) HUM routes
 // =========================
 app.post("/fingerprint/hum/url", async (req, res) => {
   const { url, jobId } = req.body;
+  console.log("✅ HIT /fingerprint/hum/url", "origin=", req.headers.origin, "jobId=", jobId);
+
   if (!url || !jobId) return res.status(400).json({ status: "error", message: "URL or JobID missing" });
 
   const job = ensureJob(jobId);
-
   job.status = "processing";
   job.error = null;
   job.result = null;
@@ -588,6 +527,7 @@ app.post("/fingerprint/hum/url", async (req, res) => {
     message: "HUM accepté, traitement en cours",
     pollUrl: `/fingerprint/${jobId}`,
     resultUrl: `/fingerprint/result/${jobId}`,
+    logsUrl: `/fingerprint/logs/${jobId}`,
   });
 
   (async () => {
@@ -620,12 +560,14 @@ app.post("/fingerprint/hum/url", async (req, res) => {
 });
 
 app.post("/fingerprint/hum/upload", upload.single("file"), async (req, res) => {
+  // PROUVE QUE LA ROUTE EST APPELEE
+  console.log("✅ HIT /fingerprint/hum/upload", "origin=", req.headers.origin, "jobId=", req.body?.jobId);
+
   const { jobId } = req.body;
   if (!req.file) return res.status(400).json({ status: "error", message: "No file" });
   if (!jobId) return res.status(400).json({ status: "error", message: "JobID missing" });
 
   const job = ensureJob(jobId);
-
   job.status = "processing";
   job.error = null;
   job.result = null;
@@ -639,6 +581,7 @@ app.post("/fingerprint/hum/upload", upload.single("file"), async (req, res) => {
     message: "HUM upload accepté, traitement en cours",
     pollUrl: `/fingerprint/${jobId}`,
     resultUrl: `/fingerprint/result/${jobId}`,
+    logsUrl: `/fingerprint/logs/${jobId}`,
   });
 
   const filePath = req.file.path;
@@ -669,91 +612,6 @@ app.post("/fingerprint/hum/upload", upload.single("file"), async (req, res) => {
       fs.unlink(filePath, () => {});
     }
   })();
-});
-
-// =========================
-// 4️⃣ MATCH route (DTW vectoriel sur chroma match.signature)
-// Body (recommandé):
-// {
-//   jobId: "hum-xxx",
-//   query: { signature:[..], shape:[T,12] },         // <= query.match.signature de Python
-//   candidates: [{ id:"track1", signature:[..], shape:[T,12] }, ...],  // <= stored match.signature
-//   topK: 5
-// }
-//
-// Fallback legacy:
-// - si pas de shape => on assume melody intervals (scalaire)
-// =========================
-app.post("/fingerprint/match", async (req, res) => {
-  const { jobId, query, candidates, topK } = req.body;
-
-  if (!jobId) return res.status(400).json({ status: "error", message: "jobId missing" });
-  if (!query?.signature || !Array.isArray(query.signature)) {
-    return res.status(400).json({ status: "error", message: "query.signature missing" });
-  }
-  if (!Array.isArray(candidates) || candidates.length === 0) {
-    return res.status(400).json({ status: "error", message: "candidates missing" });
-  }
-
-  const K = Math.max(1, Math.min(20, Number(topK) || 5));
-  pushLog(jobId, `MATCH demandé. candidates=${candidates.length}, topK=${K}`);
-
-  const useChromaMatch = Array.isArray(query.shape) && query.shape.length === 2;
-
-  // ---------- MODE CHROMA (polyphonique) ----------
-  if (useChromaMatch) {
-    const qFrames = reshapeFlatToFrames(query.signature, query.shape);
-    if (!qFrames) {
-      return res.status(400).json({
-        status: "error",
-        message: "query.shape/signature invalid (expected flat T*12 with shape [T,12])",
-      });
-    }
-
-    const scored = [];
-    for (const c of candidates) {
-      if (!c?.id) continue;
-      if (!Array.isArray(c.signature) || !Array.isArray(c.shape)) continue;
-      const cFrames = reshapeFlatToFrames(c.signature, c.shape);
-      if (!cFrames) continue;
-
-      const score = matchScoreChroma(qFrames, cFrames);
-      scored.push({ id: c.id, score });
-    }
-
-    scored.sort((a, b) => b.score - a.score);
-    const best = scored.slice(0, K);
-    const bestScore = best[0]?.score ?? 0;
-
-    return res.json({
-      status: "done",
-      jobId,
-      mode: "chroma_match_v1",
-      bestScore,
-      bestMatches: best,
-    });
-  }
-
-  // ---------- MODE MELODY (fallback mono) ----------
-  const qSig = query.signature;
-  const scored = [];
-  for (const c of candidates) {
-    if (!c?.id || !Array.isArray(c.signature) || c.signature.length === 0) continue;
-    const score = melodyScoreIntervals(qSig, c.signature);
-    scored.push({ id: c.id, score });
-  }
-
-  scored.sort((a, b) => b.score - a.score);
-  const best = scored.slice(0, K);
-  const bestScore = best[0]?.score ?? 0;
-
-  return res.json({
-    status: "done",
-    jobId,
-    mode: "melody_intervals_fallback",
-    bestScore,
-    bestMatches: best,
-  });
 });
 
 // =========================
