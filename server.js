@@ -9,7 +9,6 @@ import cors from "cors";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
 import { pipeline } from "stream/promises";
-import crypto from "crypto";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -27,7 +26,8 @@ app.use(
   })
 );
 
-app.use(express.json({ limit: "2mb" }));
+// ⚠️ augmente la limite: candidates peut être volumineux
+app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 // =========================
@@ -40,14 +40,6 @@ const API_TOKEN = "3523e792bbced184caa4f51a33a2494a";
 // =========================
 // Stockage résultats par jobId
 // =========================
-// Structure:
-// resultsByJobId[jobId] = {
-//   status: "pending" | "processing" | "done" | "error",
-//   result: <json> | null,
-//   error: string | null,
-//   logs: string[],
-//   createdAt: number,
-// }
 const resultsByJobId = Object.create(null);
 
 // =========================
@@ -100,7 +92,6 @@ setInterval(() => {
 // =========================
 function ensureJob(jobId) {
   if (!resultsByJobId[jobId]) {
-    // tente de restaurer depuis /tmp si RAM vide (restart render)
     const restored = loadJob(jobId);
     if (restored) {
       resultsByJobId[jobId] = restored;
@@ -186,9 +177,76 @@ function runPythonFingerprint(filePath, jobId) {
 }
 
 // =========================
-// ✅ Similarité mélodique (DTW) pour hum matching
+// ✅ DTW vectoriel (pour match chroma séquence)
 // =========================
-function dtwDistance(a, b) {
+function reshapeFlatToFrames(signatureFlat, shape) {
+  // shape = [T, 12]
+  if (!Array.isArray(shape) || shape.length !== 2) return null;
+  const T = Number(shape[0]) || 0;
+  const D = Number(shape[1]) || 0;
+  if (T <= 0 || D <= 0) return null;
+  if (!Array.isArray(signatureFlat) || signatureFlat.length !== T * D) return null;
+
+  const frames = new Array(T);
+  for (let t = 0; t < T; t++) {
+    const off = t * D;
+    const v = new Array(D);
+    for (let d = 0; d < D; d++) v[d] = Number(signatureFlat[off + d]) || 0;
+    frames[t] = v;
+  }
+  return frames;
+}
+
+function l1DistanceVec(a, b) {
+  // a,b length 12, ints 0..127
+  const D = Math.min(a.length, b.length);
+  let s = 0;
+  for (let i = 0; i < D; i++) s += Math.abs(a[i] - b[i]);
+  return s;
+}
+
+function dtwDistanceVec(A, B) {
+  const n = A.length;
+  const m = B.length;
+  if (n === 0 || m === 0) return Number.POSITIVE_INFINITY;
+
+  const INF = 1e18;
+  // DP "2 lignes" pour économiser RAM
+  let prev = new Float64Array(m + 1);
+  let cur = new Float64Array(m + 1);
+  for (let j = 0; j <= m; j++) prev[j] = INF;
+  prev[0] = 0;
+
+  for (let i = 1; i <= n; i++) {
+    cur[0] = INF;
+    for (let j = 1; j <= m; j++) {
+      const cost = l1DistanceVec(A[i - 1], B[j - 1]);
+      const bestPrev = Math.min(prev[j], cur[j - 1], prev[j - 1]);
+      cur[j] = cost + bestPrev;
+    }
+    // swap
+    const tmp = prev;
+    prev = cur;
+    cur = tmp;
+  }
+
+  return prev[m];
+}
+
+function matchScoreChroma(qFrames, cFrames) {
+  const dist = dtwDistanceVec(qFrames, cFrames);
+
+  // dist typique ~ (L * 12 * ~20-60) => ça peut être gros
+  // k à tuner: plus grand => scores plus hauts
+  const k = 120000; // bon départ; ajuste selon ton dataset
+  const score = 1 / (1 + dist / k);
+  return Math.max(0, Math.min(1, score));
+}
+
+// =========================
+// ✅ Melody DTW (ancien) : utile si tu veux fallback mono
+// =========================
+function dtwDistanceScalar(a, b) {
   const n = a.length;
   const m = b.length;
   const INF = 1e15;
@@ -206,11 +264,11 @@ function dtwDistance(a, b) {
   return dp[n][m];
 }
 
-function melodyScore(a, b) {
+function melodyScoreIntervals(a, b) {
   if (!Array.isArray(a) || !Array.isArray(b) || a.length === 0 || b.length === 0) return 0;
 
-  const dist = dtwDistance(a, b);
-  const k = 2500; // à tuner selon ton dataset
+  const dist = dtwDistanceScalar(a, b);
+  const k = 2500;
   const score = 1 / (1 + dist / k);
   return Math.max(0, Math.min(1, score));
 }
@@ -221,7 +279,7 @@ function melodyScore(a, b) {
 app.get("/ping", (req, res) => res.json({ status: "ok", message: "Backend awake" }));
 
 // =========================
-// 1️⃣ Routes Melody (déjà existantes)
+// 1️⃣ Routes Melody (AUdD)
 // =========================
 app.post("/melody/upload", upload.single("file"), async (req, res) => {
   const { jobId } = req.body;
@@ -248,47 +306,41 @@ app.post("/melody/upload", upload.single("file"), async (req, res) => {
       saveJob(jobId);
 
       fs.unlink(filePath, () => {});
-      return res.json({ status: "ok", jobId, message: "Upload reçu, résultat disponible sur /melody/result/:jobId" });
+      return res.json({ status: "ok", jobId, message: "Upload reçu, résultat dispo sur /melody/result/:jobId" });
     } catch (err) {
       console.error(err);
       fs.unlink(filePath, () => {});
       return res.status(500).json({ status: "error", message: "AUdD API error" });
     }
-  } else {
-    console.log("📥 Audio reçu (Python) :", req.file.originalname);
-
-    const py = spawn("python3", [pythonPath, filePath]);
-    let stdoutData = "";
-    let stderrData = "";
-
-    py.stdout.on("data", (chunk) => {
-      stdoutData += chunk.toString();
-    });
-    py.stderr.on("data", (chunk) => {
-      stderrData += chunk.toString();
-    });
-
-    py.on("close", (code) => {
-      fs.unlink(filePath, () => {});
-      if (code !== 0) {
-        console.error("❌ Python error :", stderrData);
-        return res.status(500).json({ status: "error", message: "Erreur lors du traitement Python" });
-      }
-
-      try {
-        const parsed = JSON.parse(stdoutData);
-        ensureJob(jobId);
-        resultsByJobId[jobId].status = "done";
-        resultsByJobId[jobId].result = parsed;
-        saveJob(jobId);
-
-        return res.json({ status: "ok", jobId, message: "Upload reçu, résultat disponible sur /melody/result/:jobId" });
-      } catch (err) {
-        console.error("❌ JSON invalide retourné par Python :", stdoutData);
-        return res.status(500).json({ status: "error", message: "Réponse Python invalide" });
-      }
-    });
   }
+
+  // Backend python (optionnel)
+  console.log("📥 Audio reçu (Python) :", req.file.originalname);
+  const py = spawn("python3", [pythonPath, filePath]);
+  let stdoutData = "";
+  let stderrData = "";
+
+  py.stdout.on("data", (chunk) => (stdoutData += chunk.toString()));
+  py.stderr.on("data", (chunk) => (stderrData += chunk.toString()));
+
+  py.on("close", (code) => {
+    fs.unlink(filePath, () => {});
+    if (code !== 0) {
+      console.error("❌ Python error :", stderrData);
+      return res.status(500).json({ status: "error", message: "Erreur lors du traitement Python" });
+    }
+    try {
+      const parsed = JSON.parse(stdoutData);
+      ensureJob(jobId);
+      resultsByJobId[jobId].status = "done";
+      resultsByJobId[jobId].result = parsed;
+      saveJob(jobId);
+      return res.json({ status: "ok", jobId, message: "Upload reçu, résultat dispo sur /melody/result/:jobId" });
+    } catch {
+      console.error("❌ JSON invalide retourné par Python :", stdoutData);
+      return res.status(500).json({ status: "error", message: "Réponse Python invalide" });
+    }
+  });
 });
 
 app.get("/melody/result/:jobId", (req, res) => {
@@ -296,7 +348,7 @@ app.get("/melody/result/:jobId", (req, res) => {
   if (!jobId) return res.status(400).json({ status: "error", message: "JobID manquant" });
 
   const job = resultsByJobId[jobId] || loadJob(jobId);
-  if (!job || !job.result) return res.status(404).json({ status: "error", message: "Résultat non trouvé pour ce JobID" });
+  if (!job || !job.result) return res.status(404).json({ status: "error", message: "Résultat non trouvé" });
 
   resultsByJobId[jobId] = job;
   return res.json(job.result);
@@ -311,21 +363,11 @@ app.post("/fingerprint/url", async (req, res) => {
 
   const job = ensureJob(jobId);
 
-  if (job.status === "done") {
+  if (job.status === "done" || job.status === "processing") {
     return res.json({
       status: "ok",
       jobId,
-      message: "Déjà calculé",
-      pollUrl: `/fingerprint/${jobId}`,
-      resultUrl: `/fingerprint/result/${jobId}`,
-    });
-  }
-
-  if (job.status === "processing") {
-    return res.json({
-      status: "ok",
-      jobId,
-      message: "Déjà en cours",
+      message: job.status === "done" ? "Déjà calculé" : "Déjà en cours",
       pollUrl: `/fingerprint/${jobId}`,
       resultUrl: `/fingerprint/result/${jobId}`,
     });
@@ -337,7 +379,6 @@ app.post("/fingerprint/url", async (req, res) => {
   saveJob(jobId);
 
   pushLog(jobId, "Job fingerprint démarré (URL).");
-
   const tmpFile = `/tmp/${jobId}.audio`;
 
   res.json({
@@ -433,9 +474,7 @@ app.get("/fingerprint/:jobId", (req, res) => {
   if (!jobId) return res.status(400).json({ status: "error", message: "JobID missing" });
 
   const job = resultsByJobId[jobId] || loadJob(jobId);
-  if (!job) {
-    return res.status(404).json({ status: "error", message: "JobID inconnu" });
-  }
+  if (!job) return res.status(404).json({ status: "error", message: "JobID inconnu" });
   resultsByJobId[jobId] = job;
 
   if (job.status === "done") {
@@ -505,8 +544,8 @@ app.get("/fingerprint/logs/:jobId", (req, res) => {
 });
 
 // =========================
-// 3️⃣ HUM routes (fredonnement) : calcule melody signature via Python
-// IMPORTANT: fingerprint.py doit renvoyer `melody: { signature: [...] }`
+// 3️⃣ HUM routes (fredonnement / chorale)
+//    Maintenant on renvoie match + melody (si dispo)
 // =========================
 app.post("/fingerprint/hum/url", async (req, res) => {
   const { url, jobId } = req.body;
@@ -520,7 +559,6 @@ app.post("/fingerprint/hum/url", async (req, res) => {
   saveJob(jobId);
 
   pushLog(jobId, "Job HUM démarré (URL).");
-
   const tmpFile = `/tmp/hum-${jobId}.audio`;
 
   res.json({
@@ -540,6 +578,7 @@ app.post("/fingerprint/hum/url", async (req, res) => {
       j.status = "done";
       j.result = {
         hum: true,
+        match: result.match || null,
         melody: result.melody || null,
         meta: result.meta || null,
       };
@@ -591,6 +630,7 @@ app.post("/fingerprint/hum/upload", upload.single("file"), async (req, res) => {
       j.status = "done";
       j.result = {
         hum: true,
+        match: result.match || null,
         melody: result.melody || null,
         meta: result.meta || null,
       };
@@ -611,14 +651,17 @@ app.post("/fingerprint/hum/upload", upload.single("file"), async (req, res) => {
 });
 
 // =========================
-// 4️⃣ MATCH route: Wix envoie query.signature + candidates (signatures en DB Wix)
-// Body:
+// 4️⃣ MATCH route (DTW vectoriel sur chroma match.signature)
+// Body (recommandé):
 // {
 //   jobId: "hum-xxx",
-//   query: { signature: [..] },
-//   candidates: [{ id:"track1", signature:[..] }, ...],
+//   query: { signature:[..], shape:[T,12] },         // <= query.match.signature de Python
+//   candidates: [{ id:"track1", signature:[..], shape:[T,12] }, ...],  // <= stored match.signature
 //   topK: 5
 // }
+//
+// Fallback legacy:
+// - si pas de shape => on assume melody intervals (scalaire)
 // =========================
 app.post("/fingerprint/match", async (req, res) => {
   const { jobId, query, candidates, topK } = req.body;
@@ -631,26 +674,62 @@ app.post("/fingerprint/match", async (req, res) => {
     return res.status(400).json({ status: "error", message: "candidates missing" });
   }
 
-  const qSig = query.signature;
   const K = Math.max(1, Math.min(20, Number(topK) || 5));
-
   pushLog(jobId, `MATCH demandé. candidates=${candidates.length}, topK=${K}`);
 
+  const useChromaMatch = Array.isArray(query.shape) && query.shape.length === 2;
+
+  // ---------- MODE CHROMA (polyphonique) ----------
+  if (useChromaMatch) {
+    const qFrames = reshapeFlatToFrames(query.signature, query.shape);
+    if (!qFrames) {
+      return res.status(400).json({
+        status: "error",
+        message: "query.shape/signature invalid (expected flat T*12 with shape [T,12])",
+      });
+    }
+
+    const scored = [];
+    for (const c of candidates) {
+      if (!c?.id) continue;
+      if (!Array.isArray(c.signature) || !Array.isArray(c.shape)) continue;
+      const cFrames = reshapeFlatToFrames(c.signature, c.shape);
+      if (!cFrames) continue;
+
+      const score = matchScoreChroma(qFrames, cFrames);
+      scored.push({ id: c.id, score });
+    }
+
+    scored.sort((a, b) => b.score - a.score);
+    const best = scored.slice(0, K);
+    const bestScore = best[0]?.score ?? 0;
+
+    return res.json({
+      status: "done",
+      jobId,
+      mode: "chroma_match_v1",
+      bestScore,
+      bestMatches: best,
+    });
+  }
+
+  // ---------- MODE MELODY (fallback mono) ----------
+  const qSig = query.signature;
   const scored = [];
   for (const c of candidates) {
     if (!c?.id || !Array.isArray(c.signature) || c.signature.length === 0) continue;
-    const score = melodyScore(qSig, c.signature);
+    const score = melodyScoreIntervals(qSig, c.signature);
     scored.push({ id: c.id, score });
   }
 
   scored.sort((a, b) => b.score - a.score);
-
   const best = scored.slice(0, K);
   const bestScore = best[0]?.score ?? 0;
 
   return res.json({
     status: "done",
     jobId,
+    mode: "melody_intervals_fallback",
     bestScore,
     bestMatches: best,
   });
