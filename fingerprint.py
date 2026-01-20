@@ -21,22 +21,92 @@ def _safe_float(x, default=0.0):
     except Exception:
         return float(default)
 
-def build_melody_signature(y, sr, *, hop_length=512, n_points=120):
+# ============================================================
+# 1) MATCH SIGNATURE (polyphonique) : chroma SEQUENCE compressée
+#    - robuste: chorale, voix+instruments, tempo différent (DTW côté Node)
+# ============================================================
+def build_chroma_match_signature(y, sr, *, hop_length=512, frames_per_sec=4, max_seconds=30):
     """
-    Construit une signature mélodique robuste au:
-    - changement de tonalité (on utilise des INTERVALLES)
-    - tempo différent (on downsample à n_points fixes)
-    - petits écarts (on médiane + nettoyage)
-
     Retour:
-      melody_sig: list[int] (intervals quantifiés en demi-tons*10)
-      melody_meta: dict
+      match_sig_flat: list[int]  (int8 0..127) de taille T*12
+      match_shape: [T,12]
+      match_meta: dict
     """
     import numpy as np
     import librosa
 
-    # pyin est plus stable pour la voix que pitch_tuning basique
-    # fmin/fmax: voix humaine typique ~ 80-400 Hz (homme/femme), on élargit un peu
+    # Option: limiter durée pour réduire coût CPU (Render)
+    # DTW marche mieux si on prend un "extrait" cohérent.
+    if max_seconds and max_seconds > 0:
+        max_len = int(sr * max_seconds)
+        if y.size > max_len:
+            y = y[:max_len]
+
+    log("[fingerprint.py] Computing chroma (match signature)...")
+
+    # Chroma CQT: plus robuste aux variations de timbre
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)  # (12, T)
+
+    if chroma is None or chroma.size == 0:
+        return [], [0, 12], {"match_ok": False, "reason": "empty_chroma"}
+
+    # Normaliser par frame (évite dépendance au volume)
+    eps = 1e-9
+    chroma = chroma.astype(np.float32)
+    chroma = chroma / (np.sum(chroma, axis=0, keepdims=True) + eps)  # each column sums ~1
+
+    # Downsample en temps pour avoir ~frames_per_sec
+    # fps_actuel = sr / hop_length / ??? (librosa gives frames per hop)
+    fps_actual = sr / hop_length
+    target_fps = float(frames_per_sec)
+    if target_fps <= 0:
+        target_fps = 4.0
+
+    step = int(max(1, round(fps_actual / target_fps)))  # prendre 1 frame sur 'step'
+    chroma_ds = chroma[:, ::step]  # (12, T2)
+
+    # Limiter T pour éviter payload énorme
+    # (ex: 30s * 4fps = 120 frames)
+    T = chroma_ds.shape[1]
+    if T == 0:
+        return [], [0, 12], {"match_ok": False, "reason": "downsampled_empty"}
+
+    # Quantifier en int8 [0..127]
+    q = np.clip(np.round(chroma_ds * 127.0), 0, 127).astype(np.uint8)  # (12, T)
+
+    # Format: T x 12 (plus simple côté Node)
+    q_T12 = q.T  # (T, 12)
+    flat = q_T12.reshape(-1)  # (T*12,)
+
+    # Hash lisible (optionnel)
+    match_hash = sha256_hex(flat.tobytes())
+
+    meta = {
+        "match_ok": True,
+        "type": "chroma_cqt_seq_v1",
+        "hop_length": int(hop_length),
+        "frames_per_sec": float(frames_per_sec),
+        "max_seconds": float(max_seconds),
+        "T": int(T),
+        "quant_scale": 127.0,
+        "hash": match_hash,
+    }
+    return flat.tolist(), [int(T), 12], meta
+
+# ============================================================
+# 2) MELODY SIGNATURE (monophonique) : pitch intervals (pyin)
+#    - utile surtout si chant SOLO clair
+#    - pour chorale: souvent instable => on garde mais on flag melody_ok
+# ============================================================
+def build_melody_signature(y, sr, *, hop_length=512, n_points=120, max_seconds=20):
+    import numpy as np
+    import librosa
+
+    if max_seconds and max_seconds > 0:
+        max_len = int(sr * max_seconds)
+        if y.size > max_len:
+            y = y[:max_len]
+
     fmin = librosa.note_to_hz("C2")  # ~65 Hz
     fmax = librosa.note_to_hz("C6")  # ~1046 Hz
 
@@ -49,27 +119,22 @@ def build_melody_signature(y, sr, *, hop_length=512, n_points=120):
         hop_length=hop_length
     )
 
-    # f0: array length T with NaN where unvoiced
     if f0 is None:
         return [], {"melody_ok": False, "reason": "pyin_returned_none"}
 
-    # Convert to midi for intervals (midi handles ratios nicely)
-    midi = librosa.hz_to_midi(f0)  # NaN stays NaN
+    midi = librosa.hz_to_midi(f0)  # NaN remains NaN
 
-    # Keep only voiced frames
     voiced = np.isfinite(midi)
     voiced_ratio = float(np.mean(voiced)) if midi.size else 0.0
 
-    if voiced_ratio < 0.05:
-        # presque pas de pitch détectable -> pas fiable
+    if voiced_ratio < 0.08:
         return [], {"melody_ok": False, "reason": "too_few_voiced_frames", "voiced_ratio": voiced_ratio}
 
     midi_v = midi[voiced].astype(np.float32)
 
-    # Smoothing léger (robustesse)
-    # median filter manual (petit)
-    if midi_v.size >= 5:
-        k = 5
+    # Smoothing médiane
+    if midi_v.size >= 7:
+        k = 7
         pad = k // 2
         mv = np.pad(midi_v, (pad, pad), mode="edge")
         sm = np.empty_like(midi_v)
@@ -77,17 +142,13 @@ def build_melody_signature(y, sr, *, hop_length=512, n_points=120):
             sm[i] = np.median(mv[i:i+k])
         midi_v = sm
 
-    # Intervals (différences) -> invariant à la transposition
-    intervals = np.diff(midi_v)  # len-1
+    intervals = np.diff(midi_v)
     if intervals.size == 0:
         return [], {"melody_ok": False, "reason": "intervals_empty", "voiced_ratio": voiced_ratio}
 
-    # Clip + quantize: demi-tons * 10 (plus fin)
-    intervals = np.clip(intervals, -12.0, 12.0)  # max une octave par pas (robuste)
+    intervals = np.clip(intervals, -12.0, 12.0)
     q_int = np.round(intervals * 10.0).astype(np.int16)
 
-    # Downsample à n_points fixes (tempo-invariant grossier)
-    # Si trop court, on pad; si trop long, on sample uniformément
     L = q_int.size
     if L >= n_points:
         idx = np.linspace(0, L - 1, num=n_points).astype(int)
@@ -96,20 +157,24 @@ def build_melody_signature(y, sr, *, hop_length=512, n_points=120):
         sig = np.zeros((n_points,), dtype=np.int16)
         sig[:L] = q_int
 
-    melody_bytes = sig.tobytes()
-    melody_hash = sha256_hex(melody_bytes)
+    melody_hash = sha256_hex(sig.tobytes())
 
     melody_meta = {
         "melody_ok": True,
         "voiced_ratio": voiced_ratio,
         "hop_length": int(hop_length),
         "n_points": int(n_points),
+        "max_seconds": float(max_seconds),
         "quant_scale_semitone_x10": 10.0,
-        "interval_clip_semitones": 12.0
+        "interval_clip_semitones": 12.0,
+        "melody_hash": melody_hash,
     }
 
-    return sig.tolist(), {"melody_hash": melody_hash, **melody_meta}
+    return sig.tolist(), melody_meta
 
+# ============================================================
+# MAIN
+# ============================================================
 def main():
     if len(sys.argv) < 2:
         print(json.dumps({"error": "missing filePath"}))
@@ -133,59 +198,60 @@ def main():
         if len(y) < sr * 2:
             log("[fingerprint.py] Warning: audio is very short; fingerprint may be less robust.")
 
-        # 2) Normalize (robustness)
+        # 2) Normalize
         eps = 1e-9
         y = y.astype(np.float32)
         y = y / (np.max(np.abs(y)) + eps)
 
-        # 3) Features (robustes pour identification "audio")
-        #    - Chroma: signature harmonique
-        #    - MFCC: timbre
-        #    - Onset strength: dynamique
+        # 3) Features (ton fingerprint actuel)
         log("[fingerprint.py] Computing chroma...")
-        chroma = librosa.feature.chroma_cqt(y=y, sr=sr)  # (12, T)
+        chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
 
         log("[fingerprint.py] Computing MFCC...")
-        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)  # (20, T)
+        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
 
         log("[fingerprint.py] Computing onset strength...")
-        onset_env = librosa.onset.onset_strength(y=y, sr=sr)  # (T,)
+        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
 
-        # Tempo (indicatif)
         log("[fingerprint.py] Estimating tempo...")
         tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
-        tempo = float(tempo)
+        tempo = float(_safe_float(tempo, 0.0))
 
-        # 4) Statistiques résumées + quantification
         log("[fingerprint.py] Building fingerprint vector...")
-
         chroma_mean = np.mean(chroma, axis=1)
-        chroma_std  = np.std(chroma, axis=1)
+        chroma_std = np.std(chroma, axis=1)
 
         mfcc_mean = np.mean(mfcc, axis=1)
-        mfcc_std  = np.std(mfcc, axis=1)
+        mfcc_std = np.std(mfcc, axis=1)
 
         onset_mean = float(np.mean(onset_env)) if onset_env.size else 0.0
         onset_std  = float(np.std(onset_env)) if onset_env.size else 0.0
 
-        # Vector: 12*2 + 20*2 + 2 = 66 dims
         vec = np.concatenate([
             chroma_mean, chroma_std,
             mfcc_mean, mfcc_std,
             np.array([onset_mean, onset_std], dtype=np.float32)
         ]).astype(np.float32)
 
-        # Quantification stable
-        q = np.round(vec * 1000.0).astype(np.int16)  # int16 stable
-        fp_bytes = q.tobytes()
-
-        fingerprint = sha256_hex(fp_bytes)
+        q = np.round(vec * 1000.0).astype(np.int16)
+        fingerprint = sha256_hex(q.tobytes())
         short_fp = fingerprint[:16]
 
-        # ✅ 5) AJOUT : Melody signature (pour fredonnement)
-        # On calcule sur un sous-échantillonnage (et c'est ok)
-        # NOTE: si tu veux encore plus rapide, on peut ne prendre qu'un segment.
-        melody_sig, melody_info = build_melody_signature(y, sr, hop_length=512, n_points=120)
+        # 4) ✅ MATCH signature (polyphonique) pour comparaison (chorale + solo + musique)
+        match_sig, match_shape, match_meta = build_chroma_match_signature(
+            y, sr,
+            hop_length=512,
+            frames_per_sec=4,   # ~4 fps => ~120 frames pour 30s
+            max_seconds=30
+        )
+
+        # 5) ✅ Melody signature (monophonique) (utile surtout solo)
+        melody_sig, melody_meta = build_melody_signature(
+            y, sr,
+            hop_length=512,
+            n_points=120,
+            max_seconds=20
+        )
 
         elapsed = time.time() - t0
         log(f"[fingerprint.py] Done in {elapsed:.2f}s. fingerprint={short_fp}...")
@@ -201,10 +267,17 @@ def main():
                 "quant_scale": 1000.0
             },
 
-            # ✅ Nouveau bloc pour "humming"
+            # ✅ signature polyphonique comparable (DTW côté Node)
+            "match": {
+                "shape": match_shape,        # [T,12]
+                "signature": match_sig,      # flat list length T*12 (uint8)
+                **match_meta
+            },
+
+            # ✅ pitch intervals (surtout solo)
             "melody": {
-                "signature": melody_sig,     # list[int] longueur fixe (120)
-                **melody_info               # melody_ok, voiced_ratio, melody_hash, etc.
+                "signature": melody_sig,     # list[int] len 120
+                **melody_meta
             }
         }
 
