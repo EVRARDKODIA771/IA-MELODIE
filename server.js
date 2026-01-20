@@ -18,13 +18,34 @@ const app = express();
 // =========================
 // CORS
 // =========================
+// =========================
+// CORS (Render Front + Wix + Dev)
+// =========================
+const allowedOrigins = new Set([
+  "https://ia-melodie-1.onrender.com",         // ton frontend Render
+  "https://partitionsmanagers.wixstudio.com",  // Wix (important)
+  "http://localhost:5173",                     // dev local (optionnel)
+]);
+
 app.use(
   cors({
-    origin: ["https://ia-melodie-1.onrender.com", "http://localhost:5173"],
+    origin: (origin, cb) => {
+      // Certaines requêtes (curl/server-to-server) n'ont pas d'Origin
+      if (!origin) return cb(null, true);
+
+      if (allowedOrigins.has(origin)) return cb(null, true);
+
+      console.error("❌ CORS blocked origin:", origin);
+      return cb(new Error("Not allowed by CORS: " + origin));
+    },
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type"],
   })
 );
+
+// IMPORTANT : répondre aux preflight OPTIONS
+app.options("*", cors());
+
 
 // ⚠️ augmente la limite: candidates peut être volumineux
 app.use(express.json({ limit: "10mb" }));
