@@ -1,14 +1,10 @@
 import { useRef, useState, useEffect } from "react";
 import "./Recorder.css";
 
-// ======================
-// URL du backend depuis .env
-// ======================
+// URL backend depuis .env (doit être https://ia-melodie.onrender.com)
 const backendUrl = import.meta.env.VITE_BACKEND_URL;
 
-// IMPORTANT: ton Node API (fingerprint) est sur ia-melodie.onrender.com
-// Si VITE_BACKEND_URL pointe déjà vers ia-melodie.onrender.com, tu peux laisser = backendUrl
-// Sinon, garde ce fallback explicite.
+// fallback si jamais .env est vide (évite d'envoyer vers ia-melodie-1 par erreur)
 const apiUrl = backendUrl || "https://ia-melodie.onrender.com";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -45,18 +41,13 @@ export default function Recorder() {
 
   const [status, setStatus] = useState("Touchez le micro pour chanter");
   const [result, setResult] = useState(null);
-  const [jobId, setJobId] = useState(null);
 
   // ======================
-  // Récupérer jobId et returnUrl depuis query param
+  // Query params Wix
   // ======================
   const urlParams = new URLSearchParams(window.location.search);
-  const jobIdFromWix = urlParams.get("jobId"); // jobId fourni par Wix
+  const jobIdFromWix = urlParams.get("jobId");
   const returnUrl = urlParams.get("returnUrl");
-
-  useEffect(() => {
-    if (jobIdFromWix) setJobId(jobIdFromWix);
-  }, [jobIdFromWix]);
 
   const formatTime = (s) =>
     `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(
@@ -65,24 +56,19 @@ export default function Recorder() {
     )}`;
 
   // ======================
-  // Polling fingerprint (route: /fingerprint/:jobId)
+  // Polling générique (utilise /fingerprint/:jobId)
   // ======================
-  const pollFingerprint = async (
-    pollJobId,
-    { interval = 2000, timeout = 120000 } = {}
-  ) => {
+  const pollJob = async (pollJobId, { interval = 1500, timeout = 120000 } = {}) => {
     const start = Date.now();
 
     while (true) {
-      if (Date.now() - start > timeout) throw new Error("Timeout fingerprint");
+      if (Date.now() - start > timeout) throw new Error("Timeout polling");
 
       const r = await fetch(`${apiUrl}/fingerprint/${pollJobId}`);
       const data = await r.json();
 
-      // data = {status:"processing"/"done"/"error", jobId, resultUrl, fingerprint?}
       if (data.status === "done") return data;
-      if (data.status === "error")
-        throw new Error(data.message || "Fingerprint error");
+      if (data.status === "error") throw new Error(data.message || "Job error");
 
       await sleep(interval);
     }
@@ -107,6 +93,7 @@ export default function Recorder() {
     setResult(null);
 
     recorder.ondataavailable = (e) => chunksRef.current.push(e.data);
+
     recorder.onstop = () => {
       const blob = new Blob(chunksRef.current, { type: "audio/webm" });
       setAudioBlob(blob);
@@ -120,15 +107,10 @@ export default function Recorder() {
     setTime(0);
     setStatus("🎶 Enregistrement en cours...");
 
-    // Timer
     timerRef.current = setInterval(() => setTime((t) => t + 1), 1000);
 
-    // Auto-stop après 7 secondes
     setTimeout(() => {
-      if (
-        mediaRecorderRef.current &&
-        mediaRecorderRef.current.state === "recording"
-      ) {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
         stopRecording();
       }
     }, 7000);
@@ -165,38 +147,36 @@ export default function Recorder() {
   };
 
   // ======================
-  // SEND AUDIO : AUdD + Fingerprint en parallèle (sans casser l'un ou l'autre)
+  // SEND AUDIO : AUdD + HUM en parallèle
   // ======================
   const sendAudio = async (blob, baseJobId) => {
     if (!blob || !baseJobId) return;
 
-    // 1) AUdD jobId = baseJobId
+    // AUdD
     const fdAudd = new FormData();
     fdAudd.append("file", blob, "recording.webm");
     fdAudd.append("jobId", baseJobId);
 
-    // 2) Fingerprint jobId = baseJobId + "-fp" (évite collision)
-    const fpJobId = `${baseJobId}-fp`;
-    const fdFp = new FormData();
-    fdFp.append("file", blob, "recording.webm");
-    fdFp.append("jobId", fpJobId);
+    // HUM (IMPORTANT)
+    const humJobId = `${baseJobId}-hum`;
+    const fdHum = new FormData();
+    fdHum.append("file", blob, "recording.webm");
+    fdHum.append("jobId", humJobId);
 
-    setStatus("🧠 Envoi AUdD + Fingerprint en parallèle...");
+    setStatus("🧠 Envoi AUdD + HUM en parallèle...");
 
-    // Lance les deux requêtes en parallèle
-    const [auddSettled, fpSettled] = await Promise.allSettled([
+    const [auddSettled, humSettled] = await Promise.allSettled([
       fetch(`${apiUrl}/melody/upload?backend=audd`, {
         method: "POST",
         body: fdAudd,
       }),
-      // IMPORTANT: dans ton server.js actuel, la route est /fingerprint/upload (pas /fingerprint/hum/upload)
-      fetch(`${apiUrl}/fingerprint/upload`, {
+      fetch(`${apiUrl}/fingerprint/hum/upload`, {
         method: "POST",
-        body: fdFp,
+        body: fdHum,
       }),
     ]);
 
-    // --- AUdD ---
+    // ===== AUdD 결과 =====
     let auddOk = false;
     let auddResultUrl = null;
 
@@ -212,74 +192,95 @@ export default function Recorder() {
       console.error("AUdD error:", auddSettled.reason);
     }
 
-    // --- Fingerprint ---
-    let fpOk = false;
-    let fpFingerprint = null;
-    let fpResultUrl = `${apiUrl}/fingerprint/result/${fpJobId}`;
+    // ===== HUM 결과 =====
+    let humOk = false;
+    let humResultUrl = `${apiUrl}/fingerprint/result/${humJobId}`;
 
-    if (fpSettled.status === "fulfilled") {
-      const fpRes = fpSettled.value;
-      if (fpRes.ok) {
-        fpOk = true;
+    // Champs HUM utiles
+    let humSignatureOk = false;
+    let humMelodyHash = null;
+    let humVoicedRatio = null;
+    let humSignatureLen = null;
+
+    if (humSettled.status === "fulfilled") {
+      const humRes = humSettled.value;
+      if (humRes.ok) {
+        humOk = true;
 
         try {
-          // 1) poll jusqu'à done
-          const pollData = await pollFingerprint(fpJobId);
+          // 1) attendre done
+          const pollData = await pollJob(humJobId);
 
-          // 2) fetch JSON final via resultUrl renvoyé
+          // 2) fetch json final
           const finalUrl = pollData.resultUrl
             ? `${apiUrl}${pollData.resultUrl}`
-            : fpResultUrl;
+            : humResultUrl;
 
           const finalRes = await fetch(finalUrl);
           const finalJson = await finalRes.json();
 
-          // python renvoie: { fingerprint, fingerprint_short, meta }
-          fpFingerprint = finalJson.fingerprint || pollData.fingerprint || null;
+          // server.js HUM met: { status:"done", jobId, hum:true, melody:{...}, meta:{...} }
+          const melody = finalJson?.melody || null;
 
-          // si jamais le resultUrl renvoyé est plus précis, on le garde
-          fpResultUrl = finalUrl;
+          humResultUrl = finalUrl;
+
+          humSignatureOk = Boolean(melody?.melody_ok);
+          humMelodyHash = melody?.melody_hash || null;
+          humVoicedRatio = melody?.voiced_ratio ?? null;
+
+          // signature = liste d'intervalles (120) si OK
+          if (Array.isArray(melody?.signature)) {
+            humSignatureLen = melody.signature.length;
+          }
         } catch (e) {
-          fpOk = false;
-          console.error("Fingerprint polling/fetch error:", e);
+          humOk = false;
+          console.error("HUM polling/fetch error:", e);
         }
       } else {
-        console.error("Fingerprint HTTP error:", fpRes.status);
+        console.error("HUM HTTP error:", humRes.status);
       }
     } else {
-      console.error("Fingerprint error:", fpSettled.reason);
+      console.error("HUM error:", humSettled.reason);
     }
 
-    // --- Status global ---
-    if (auddOk && fpOk) setStatus("✅ AUdD + Fingerprint terminés");
-    else if (auddOk) setStatus("⚠️ AUdD OK, Fingerprint échoué");
-    else if (fpOk) setStatus("⚠️ Fingerprint OK, AUdD échoué");
-    else setStatus("❌ AUdD + Fingerprint échoués");
+    // ===== Status UI =====
+    if (auddOk && humOk) setStatus("✅ AUdD + HUM terminés");
+    else if (auddOk) setStatus("⚠️ AUdD OK, HUM échoué");
+    else if (humOk) setStatus("⚠️ HUM OK, AUdD échoué");
+    else setStatus("❌ AUdD + HUM échoués");
 
-    // --- UI result (debug) ---
+    // ===== Debug UI =====
     const out = {
       jobId: baseJobId,
       auddResultUrl,
-      fpJobId,
-      fpResultUrl,
-      fpFingerprint,
+      humJobId,
+      humResultUrl,
+      humSignatureOk,
+      humMelodyHash,
+      humVoicedRatio,
+      humSignatureLen,
     };
     setResult(out);
 
-    // --- Redirection Wix ---
-    // Même logique que AUdD : on renvoie AUSSI l'URL du JSON fingerprint
+    // ===== Retour Wix =====
+    // On renvoie comme AUdD + champs HUM
     if (returnUrl) {
       try {
         const wixUrl = new URL(decodeURIComponent(returnUrl));
         wixUrl.searchParams.set("jobId", baseJobId);
 
-        // AUdD (comme avant)
+        // AUdD (inchangé)
         if (auddResultUrl) wixUrl.searchParams.set("resultUrl", auddResultUrl);
 
-        // Fingerprint (nouveau, même philosophie)
-        wixUrl.searchParams.set("fingerprintJobId", fpJobId);
-        wixUrl.searchParams.set("fingerprintResultUrl", fpResultUrl);
-        if (fpFingerprint) wixUrl.searchParams.set("fingerprint", fpFingerprint);
+        // HUM (nouveau)
+        wixUrl.searchParams.set("humJobId", humJobId);
+        wixUrl.searchParams.set("humResultUrl", humResultUrl);
+
+        // petits champs utiles pour debug côté Wix
+        wixUrl.searchParams.set("humSignatureOk", String(humSignatureOk));
+        if (humMelodyHash) wixUrl.searchParams.set("humMelodyHash", humMelodyHash);
+        if (humVoicedRatio != null) wixUrl.searchParams.set("humVoicedRatio", String(humVoicedRatio));
+        if (humSignatureLen != null) wixUrl.searchParams.set("humSignatureLen", String(humSignatureLen));
 
         window.location.href = wixUrl.toString();
       } catch (err) {
@@ -296,23 +297,15 @@ export default function Recorder() {
       <div className="title">PARTITION MANAGER</div>
       <div className="subtitle">Chantez ou fredonnez une musique</div>
 
-      {/* SHAZAM CIRCLE */}
-      <div
-        className="pulse-wrapper"
-        onClick={!isRecording ? startRecording : stopRecording}
-      >
+      <div className="pulse-wrapper" onClick={!isRecording ? startRecording : stopRecording}>
         {isRecording && !isPaused && <div className="pulse" />}
         {isRecording && !isPaused && <div className="pulse delay" />}
         <div className="center-circle">🎤</div>
       </div>
 
-      {/* TIMER */}
       <div className="time">{formatTime(time)}</div>
-
-      {/* STATUS */}
       <div className="status">{status}</div>
 
-      {/* CONTROLS */}
       {isRecording && (
         <div className="buttons">
           <button onClick={togglePause}>
@@ -321,7 +314,6 @@ export default function Recorder() {
         </div>
       )}
 
-      {/* RESULT */}
       {result && (
         <div className="result">
           <p>JobID : {result.jobId}</p>
@@ -329,32 +321,41 @@ export default function Recorder() {
           {result.auddResultUrl && (
             <p>
               AUdD résultat :{" "}
-              <a
-                href={result.auddResultUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
+              <a href={result.auddResultUrl} target="_blank" rel="noopener noreferrer">
                 {result.auddResultUrl}
               </a>
             </p>
           )}
 
-          <p>Fingerprint JobID : {result.fpJobId}</p>
+          <hr />
 
+          <p>HUM JobID : {result.humJobId}</p>
           <p>
-            Fingerprint JSON :{" "}
-            <a
-              href={result.fpResultUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              {result.fpResultUrl}
+            HUM JSON :{" "}
+            <a href={result.humResultUrl} target="_blank" rel="noopener noreferrer">
+              {result.humResultUrl}
             </a>
           </p>
 
-          {result.fpFingerprint && (
+          <p>
+            HUM melody_ok : <b>{String(result.humSignatureOk)}</b>
+          </p>
+
+          {result.humMelodyHash && (
             <p>
-              Empreinte musicale : <b>{result.fpFingerprint}</b>
+              HUM melody_hash : <b>{result.humMelodyHash}</b>
+            </p>
+          )}
+
+          {result.humVoicedRatio != null && (
+            <p>
+              HUM voiced_ratio : <b>{String(result.humVoicedRatio)}</b>
+            </p>
+          )}
+
+          {result.humSignatureLen != null && (
+            <p>
+              HUM signature_len : <b>{String(result.humSignatureLen)}</b>
             </p>
           )}
         </div>
