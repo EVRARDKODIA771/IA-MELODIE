@@ -33,47 +33,45 @@ const allowedOrigins = new Set([
 
 const corsOptions = {
   origin: (origin, cb) => {
-    // Requêtes sans Origin (curl, server-to-server)
     if (!origin) return cb(null, true);
-
     if (allowedOrigins.has(origin)) return cb(null, true);
-
     console.error("❌ CORS blocked origin:", origin);
     return cb(new Error("Not allowed by CORS: " + origin));
   },
   methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
-  // important si un jour tu utilises cookies; sinon laisse false
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
   credentials: false,
   maxAge: 86400,
 };
 
-// IMPORTANT : CORS d'abord
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
-// (optionnel) log toutes les requêtes entrantes (utile Render)
 app.use((req, _res, next) => {
   console.log(`➡️ ${req.method} ${req.url} | origin=${req.headers.origin || "none"}`);
   next();
 });
 
 // JSON
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 // =========================
 // Upload config
 // =========================
-// Limites pour éviter crash / timeouts silencieux
 const upload = multer({
   dest: "/tmp",
   limits: {
-    fileSize: 15 * 1024 * 1024, // 15MB (ajuste si besoin)
+    fileSize: 25 * 1024 * 1024, // 25MB
   },
 });
 
-const pythonPath = path.join(__dirname, "fingerprint.py");
+// =========================
+// Python scripts
+// =========================
+const pythonFingerprintPath = path.join(__dirname, "fingerprint.py"); // EXISTANT
+const pythonQbhPath = path.join(__dirname, "qbh_engine.py");          // NOUVEAU
+
 const API_TOKEN = "3523e792bbced184caa4f51a33a2494a";
 
 // =========================
@@ -152,7 +150,7 @@ function pushLog(jobId, line) {
   const job = ensureJob(jobId);
   const msg = `[${new Date().toISOString()}] ${line}`;
   job.logs.push(msg);
-  if (job.logs.length > 500) job.logs.shift();
+  if (job.logs.length > 800) job.logs.shift();
   console.log(`🧾 [${jobId}] ${line}`);
   saveJob(jobId);
 }
@@ -167,11 +165,14 @@ async function downloadToFile(url, destPath, jobId) {
   pushLog(jobId, `Téléchargement OK -> ${destPath}`);
 }
 
+// =========================
+// Python runner (EXISTANT fingerprint.py)
+// =========================
 function runPythonFingerprint(filePath, jobId) {
   return new Promise((resolve, reject) => {
-    pushLog(jobId, `Lancement Python: python3 ${pythonPath} ${filePath}`);
+    pushLog(jobId, `Lancement Python: python3 ${pythonFingerprintPath} ${filePath}`);
 
-    const py = spawn("python3", [pythonPath, filePath], {
+    const py = spawn("python3", [pythonFingerprintPath, filePath], {
       env: { ...process.env },
     });
 
@@ -214,6 +215,64 @@ function runPythonFingerprint(filePath, jobId) {
 }
 
 // =========================
+// Python runner (NOUVEAU qbh_engine.py via stdin JSON)
+// =========================
+function runPythonQBH(payload, jobId) {
+  return new Promise((resolve, reject) => {
+    pushLog(jobId, `Lancement QBH: python3 ${pythonQbhPath} (mode=${payload?.mode})`);
+
+    const py = spawn("python3", [pythonQbhPath], {
+      env: { ...process.env },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderrBuffer = "";
+
+    py.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+
+    py.stderr.on("data", (chunk) => {
+      const text = chunk.toString();
+      stderrBuffer += text;
+      const lines = text.split(/\r?\n/).filter(Boolean);
+      for (const l of lines) pushLog(jobId, `QBH: ${l}`);
+    });
+
+    py.on("error", (err) => {
+      pushLog(jobId, `QBH spawn error: ${err.message}`);
+      reject(err);
+    });
+
+    py.on("close", (code) => {
+      pushLog(jobId, `QBH terminé avec code=${code}`);
+
+      if (code !== 0) {
+        const errMsg = `QBH error (code=${code}). Stderr(last): ${stderrBuffer.slice(-2000)}`;
+        return reject(new Error(errMsg));
+      }
+
+      try {
+        const parsed = JSON.parse(stdout.trim());
+        return resolve(parsed);
+      } catch (e) {
+        const errMsg = `JSON invalide retourné par QBH. stdout(last): ${stdout.slice(-2000)}`;
+        return reject(new Error(errMsg));
+      }
+    });
+
+    // send payload via stdin
+    try {
+      py.stdin.write(JSON.stringify(payload));
+      py.stdin.end();
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+// =========================
 // DEBUG route: test CORS sans upload
 // =========================
 app.get("/debug/echo", (req, res) => {
@@ -231,7 +290,7 @@ app.get("/debug/echo", (req, res) => {
 app.get("/ping", (_req, res) => res.json({ status: "ok", message: "Backend awake" }));
 
 // =========================
-// 1) Melody (AUdD)
+// 1) Melody (AUdD) (INCHANGÉ)
 // =========================
 app.post("/melody/upload", upload.single("file"), async (req, res) => {
   console.log("✅ HIT /melody/upload", "origin=", req.headers.origin, "jobId=", req.body?.jobId);
@@ -273,9 +332,8 @@ app.post("/melody/upload", upload.single("file"), async (req, res) => {
     }
   }
 
-  // Backend python (optionnel)
   console.log("📥 Audio reçu (Python) :", req.file.originalname);
-  const py = spawn("python3", [pythonPath, filePath]);
+  const py = spawn("python3", [pythonFingerprintPath, filePath]); // on garde comme avant
   let stdoutData = "";
   let stderrData = "";
 
@@ -314,7 +372,7 @@ app.get("/melody/result/:jobId", (req, res) => {
 });
 
 // =========================
-// 2) Fingerprint generic (inchangé)
+// 2) Fingerprint generic (INCHANGÉ)
 // =========================
 app.post("/fingerprint/url", async (req, res) => {
   const { url, jobId } = req.body;
@@ -503,65 +561,27 @@ app.get("/fingerprint/logs/:jobId", (req, res) => {
   return res.json({ status: "ok", jobId, logs: job.logs || [] });
 });
 
-// =========================
-// 3) HUM routes
-// =========================
-app.post("/fingerprint/hum/url", async (req, res) => {
-  const { url, jobId } = req.body;
-  console.log("✅ HIT /fingerprint/hum/url", "origin=", req.headers.origin, "jobId=", jobId);
+// ============================================================
+// 4) QBH (Option A + Option B) - NOUVELLES ROUTES
+// ============================================================
 
-  if (!url || !jobId) return res.status(400).json({ status: "error", message: "URL or JobID missing" });
-
-  const job = ensureJob(jobId);
-  job.status = "processing";
-  job.error = null;
-  job.result = null;
-  saveJob(jobId);
-
-  pushLog(jobId, "Job HUM démarré (URL).");
-  const tmpFile = `/tmp/hum-${jobId}.audio`;
-
-  res.json({
-    status: "ok",
-    jobId,
-    message: "HUM accepté, traitement en cours",
-    pollUrl: `/fingerprint/${jobId}`,
-    resultUrl: `/fingerprint/result/${jobId}`,
-    logsUrl: `/fingerprint/logs/${jobId}`,
-  });
-
-  (async () => {
+// helper: parse candidates JSON (string ou objet)
+function parseCandidates(raw) {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === "string") {
     try {
-      await downloadToFile(url, tmpFile, jobId);
-      const result = await runPythonFingerprint(tmpFile, jobId);
-
-      const j = ensureJob(jobId);
-      j.status = "done";
-      j.result = {
-        hum: true,
-        match: result.match || null,
-        melody: result.melody || null,
-        meta: result.meta || null,
-      };
-      j.error = null;
-      saveJob(jobId);
-      pushLog(jobId, "Job HUM terminé ✅");
-    } catch (err) {
-      const j = ensureJob(jobId);
-      j.status = "error";
-      j.error = err.message || String(err);
-      j.result = null;
-      saveJob(jobId);
-      pushLog(jobId, `Job HUM échoué ❌ : ${j.error}`);
-    } finally {
-      fs.unlink(tmpFile, () => {});
+      return JSON.parse(raw);
+    } catch {
+      return [];
     }
-  })();
-});
+  }
+  return [];
+}
 
-app.post("/fingerprint/hum/upload", upload.single("file"), async (req, res) => {
-  // PROUVE QUE LA ROUTE EST APPELEE
-  console.log("✅ HIT /fingerprint/hum/upload", "origin=", req.headers.origin, "jobId=", req.body?.jobId);
+// ----------- QBH INDEX (upload) -----------
+app.post("/qbh/index/upload", upload.single("file"), async (req, res) => {
+  console.log("✅ HIT /qbh/index/upload", "origin=", req.headers.origin, "jobId=", req.body?.jobId);
 
   const { jobId } = req.body;
   if (!req.file) return res.status(400).json({ status: "error", message: "No file" });
@@ -573,45 +593,274 @@ app.post("/fingerprint/hum/upload", upload.single("file"), async (req, res) => {
   job.result = null;
   saveJob(jobId);
 
-  pushLog(jobId, "Job HUM démarré (UPLOAD).");
+  pushLog(jobId, "QBH INDEX démarré (UPLOAD).");
 
   res.json({
     status: "ok",
     jobId,
-    message: "HUM upload accepté, traitement en cours",
-    pollUrl: `/fingerprint/${jobId}`,
-    resultUrl: `/fingerprint/result/${jobId}`,
-    logsUrl: `/fingerprint/logs/${jobId}`,
+    message: "QBH index accepté",
+    pollUrl: `/qbh/${jobId}`,
+    resultUrl: `/qbh/result/${jobId}`,
+    logsUrl: `/qbh/logs/${jobId}`,
   });
 
   const filePath = req.file.path;
 
   (async () => {
     try {
-      const result = await runPythonFingerprint(filePath, jobId);
+      const payload = {
+        mode: "index",
+        audio_path: filePath,
+        sr: 22050,
+        max_seconds: 30,
+      };
+      const result = await runPythonQBH(payload, jobId);
 
       const j = ensureJob(jobId);
       j.status = "done";
-      j.result = {
-        hum: true,
-        match: result.match || null,
-        melody: result.melody || null,
-        meta: result.meta || null,
-      };
+      j.result = result; // contient melodySig + chromaSig
       j.error = null;
       saveJob(jobId);
-      pushLog(jobId, "Job HUM terminé ✅");
+      pushLog(jobId, "QBH INDEX terminé ✅");
     } catch (err) {
       const j = ensureJob(jobId);
       j.status = "error";
       j.error = err.message || String(err);
       j.result = null;
       saveJob(jobId);
-      pushLog(jobId, `Job HUM échoué ❌ : ${j.error}`);
+      pushLog(jobId, `QBH INDEX échoué ❌ : ${j.error}`);
     } finally {
       fs.unlink(filePath, () => {});
     }
   })();
+});
+
+// ----------- QBH INDEX (url) -----------
+app.post("/qbh/index/url", async (req, res) => {
+  const { url, jobId } = req.body;
+  console.log("✅ HIT /qbh/index/url", "origin=", req.headers.origin, "jobId=", jobId);
+
+  if (!url || !jobId) return res.status(400).json({ status: "error", message: "URL or JobID missing" });
+
+  const job = ensureJob(jobId);
+  job.status = "processing";
+  job.error = null;
+  job.result = null;
+  saveJob(jobId);
+
+  pushLog(jobId, "QBH INDEX démarré (URL).");
+
+  res.json({
+    status: "ok",
+    jobId,
+    message: "QBH index accepté",
+    pollUrl: `/qbh/${jobId}`,
+    resultUrl: `/qbh/result/${jobId}`,
+    logsUrl: `/qbh/logs/${jobId}`,
+  });
+
+  const tmpFile = `/tmp/qbh-index-${jobId}.audio`;
+
+  (async () => {
+    try {
+      await downloadToFile(url, tmpFile, jobId);
+
+      const payload = {
+        mode: "index",
+        audio_path: tmpFile,
+        sr: 22050,
+        max_seconds: 30,
+      };
+      const result = await runPythonQBH(payload, jobId);
+
+      const j = ensureJob(jobId);
+      j.status = "done";
+      j.result = result;
+      j.error = null;
+      saveJob(jobId);
+      pushLog(jobId, "QBH INDEX terminé ✅");
+    } catch (err) {
+      const j = ensureJob(jobId);
+      j.status = "error";
+      j.error = err.message || String(err);
+      j.result = null;
+      saveJob(jobId);
+      pushLog(jobId, `QBH INDEX échoué ❌ : ${j.error}`);
+    } finally {
+      fs.unlink(tmpFile, () => {});
+    }
+  })();
+});
+
+// ----------- QBH QUERY (upload) -----------
+app.post("/qbh/query/upload", upload.single("file"), async (req, res) => {
+  console.log("✅ HIT /qbh/query/upload", "origin=", req.headers.origin, "jobId=", req.body?.jobId);
+
+  const { jobId } = req.body;
+  const candidates = parseCandidates(req.body?.candidates);
+
+  if (!req.file) return res.status(400).json({ status: "error", message: "No file" });
+  if (!jobId) return res.status(400).json({ status: "error", message: "JobID missing" });
+  if (!candidates?.length) return res.status(400).json({ status: "error", message: "candidates missing/empty" });
+
+  const job = ensureJob(jobId);
+  job.status = "processing";
+  job.error = null;
+  job.result = null;
+  saveJob(jobId);
+
+  pushLog(jobId, `QBH QUERY démarré (UPLOAD) candidates=${candidates.length}`);
+
+  res.json({
+    status: "ok",
+    jobId,
+    message: "QBH query accepté",
+    pollUrl: `/qbh/${jobId}`,
+    resultUrl: `/qbh/result/${jobId}`,
+    logsUrl: `/qbh/logs/${jobId}`,
+  });
+
+  const filePath = req.file.path;
+
+  (async () => {
+    try {
+      const payload = {
+        mode: "query",
+        audio_path: filePath,
+        candidates,
+        top_k: 10,
+        sr: 22050,
+        max_seconds: 15, // query plus court = mieux pour latence
+      };
+      const result = await runPythonQBH(payload, jobId);
+
+      const j = ensureJob(jobId);
+      j.status = "done";
+      j.result = result; // top matches
+      j.error = null;
+      saveJob(jobId);
+      pushLog(jobId, "QBH QUERY terminé ✅");
+    } catch (err) {
+      const j = ensureJob(jobId);
+      j.status = "error";
+      j.error = err.message || String(err);
+      j.result = null;
+      saveJob(jobId);
+      pushLog(jobId, `QBH QUERY échoué ❌ : ${j.error}`);
+    } finally {
+      fs.unlink(filePath, () => {});
+    }
+  })();
+});
+
+// ----------- QBH QUERY (url) -----------
+app.post("/qbh/query/url", async (req, res) => {
+  const { url, jobId, candidates } = req.body;
+  console.log("✅ HIT /qbh/query/url", "origin=", req.headers.origin, "jobId=", jobId);
+
+  const cand = parseCandidates(candidates);
+
+  if (!url || !jobId) return res.status(400).json({ status: "error", message: "URL or JobID missing" });
+  if (!cand?.length) return res.status(400).json({ status: "error", message: "candidates missing/empty" });
+
+  const job = ensureJob(jobId);
+  job.status = "processing";
+  job.error = null;
+  job.result = null;
+  saveJob(jobId);
+
+  pushLog(jobId, `QBH QUERY démarré (URL) candidates=${cand.length}`);
+
+  res.json({
+    status: "ok",
+    jobId,
+    message: "QBH query accepté",
+    pollUrl: `/qbh/${jobId}`,
+    resultUrl: `/qbh/result/${jobId}`,
+    logsUrl: `/qbh/logs/${jobId}`,
+  });
+
+  const tmpFile = `/tmp/qbh-query-${jobId}.audio`;
+
+  (async () => {
+    try {
+      await downloadToFile(url, tmpFile, jobId);
+
+      const payload = {
+        mode: "query",
+        audio_path: tmpFile,
+        candidates: cand,
+        top_k: 10,
+        sr: 22050,
+        max_seconds: 15,
+      };
+      const result = await runPythonQBH(payload, jobId);
+
+      const j = ensureJob(jobId);
+      j.status = "done";
+      j.result = result;
+      j.error = null;
+      saveJob(jobId);
+      pushLog(jobId, "QBH QUERY terminé ✅");
+    } catch (err) {
+      const j = ensureJob(jobId);
+      j.status = "error";
+      j.error = err.message || String(err);
+      j.result = null;
+      saveJob(jobId);
+      pushLog(jobId, `QBH QUERY échoué ❌ : ${j.error}`);
+    } finally {
+      fs.unlink(tmpFile, () => {});
+    }
+  })();
+});
+
+// ----------- QBH poll/result/logs -----------
+app.get("/qbh/:jobId", (req, res) => {
+  const { jobId } = req.params;
+  if (!jobId) return res.status(400).json({ status: "error", message: "JobID missing" });
+
+  const job = resultsByJobId[jobId] || loadJob(jobId);
+  if (!job) return res.status(404).json({ status: "error", message: "JobID inconnu" });
+  resultsByJobId[jobId] = job;
+
+  if (job.status === "done") {
+    return res.json({ status: "done", jobId, resultUrl: `/qbh/result/${jobId}` });
+  }
+  if (job.status === "error") {
+    return res.json({ status: "error", jobId, message: job.error || "Erreur inconnue", resultUrl: `/qbh/result/${jobId}` });
+  }
+  return res.json({ status: job.status, jobId, resultUrl: `/qbh/result/${jobId}` });
+});
+
+app.get("/qbh/result/:jobId", (req, res) => {
+  const { jobId } = req.params;
+  if (!jobId) return res.status(400).json({ status: "error", message: "JobID missing" });
+
+  const job = resultsByJobId[jobId] || loadJob(jobId);
+  if (!job) return res.status(404).json({ status: "error", message: "JobID inconnu" });
+  resultsByJobId[jobId] = job;
+
+  if (job.status === "done") {
+    return res.json({ status: "done", jobId, ...job.result });
+  }
+  if (job.status === "error") {
+    return res.status(500).json({
+      status: "error",
+      jobId,
+      message: job.error || "Erreur inconnue",
+      logsTail: (job.logs || []).slice(-30),
+    });
+  }
+  return res.status(202).json({ status: job.status, jobId, message: "Pas prêt" });
+});
+
+app.get("/qbh/logs/:jobId", (req, res) => {
+  const { jobId } = req.params;
+  const job = resultsByJobId[jobId] || loadJob(jobId);
+  if (!job) return res.status(404).json({ status: "error", message: "JobID inconnu" });
+  resultsByJobId[jobId] = job;
+  return res.json({ status: "ok", jobId, logs: job.logs || [] });
 });
 
 // =========================
