@@ -70,7 +70,7 @@ const upload = multer({
 // Python scripts
 // =========================
 const pythonFingerprintPath = path.join(__dirname, "fingerprint.py"); // EXISTANT
-const pythonQbhPath = path.join(__dirname, "qbh_engine.py");          // NOUVEAU
+const pythonQbhPath = path.join(__dirname, "qbh_engine.py"); // NOUVEAU
 
 const API_TOKEN = "3523e792bbced184caa4f51a33a2494a";
 
@@ -195,8 +195,14 @@ function runPythonFingerprint(filePath, jobId) {
       reject(err);
     });
 
-    py.on("close", (code) => {
-      pushLog(jobId, `Python terminé avec code=${code}`);
+    // ✅ FIX: close => (code, signal)
+    py.on("close", (code, signal) => {
+      pushLog(jobId, `Python terminé avec code=${code} signal=${signal || "none"}`);
+
+      if (signal) {
+        const errMsg = `Python killed by signal=${signal}. Stderr(last): ${stderrBuffer.slice(-2000)}`;
+        return reject(new Error(errMsg));
+      }
 
       if (code !== 0) {
         const errMsg = `Python error (code=${code}). Stderr(last): ${stderrBuffer.slice(-2000)}`;
@@ -245,8 +251,14 @@ function runPythonQBH(payload, jobId) {
       reject(err);
     });
 
-    py.on("close", (code) => {
-      pushLog(jobId, `QBH terminé avec code=${code}`);
+    // ✅ FIX: close => (code, signal)
+    py.on("close", (code, signal) => {
+      pushLog(jobId, `QBH terminé avec code=${code} signal=${signal || "none"}`);
+
+      if (signal) {
+        const errMsg = `QBH killed by signal=${signal}. Stderr(last): ${stderrBuffer.slice(-2000)}`;
+        return reject(new Error(errMsg));
+      }
 
       if (code !== 0) {
         const errMsg = `QBH error (code=${code}). Stderr(last): ${stderrBuffer.slice(-2000)}`;
@@ -340,8 +352,12 @@ app.post("/melody/upload", upload.single("file"), async (req, res) => {
   py.stdout.on("data", (chunk) => (stdoutData += chunk.toString()));
   py.stderr.on("data", (chunk) => (stderrData += chunk.toString()));
 
-  py.on("close", (code) => {
+  py.on("close", (code, signal) => {
     fs.unlink(filePath, () => {});
+    if (signal) {
+      console.error("❌ Python killed signal :", signal, stderrData);
+      return res.status(500).json({ status: "error", message: `Python killed: ${signal}` });
+    }
     if (code !== 0) {
       console.error("❌ Python error :", stderrData);
       return res.status(500).json({ status: "error", message: "Erreur lors du traitement Python" });
