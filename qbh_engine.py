@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 # qbh_engine.py
-import sys, json, base64, traceback
+import sys, json, base64, traceback, os, tempfile, subprocess
 import numpy as np
+
+# ============================================================
+# CONFIG (IMPORTANT: évite kill Render)
+# ============================================================
+DEFAULT_SR = 22050
+DEFAULT_MAX_SECONDS = 12.0   # ✅ index/query: ne dépasse pas 12-15s sur Render
+MELODY_FPS = 15              # ✅ moins lourd que 20
+CHROMA_FPS = 4
 
 # ============================================================
 # LOGS streaming (Node suit stderr en direct)
@@ -38,13 +46,39 @@ def b64_decode_uint8(s: str, shape) -> np.ndarray:
     return arr.reshape(shape)
 
 # ============================================================
-# Audio loading
+# ffmpeg conversion + CUT early (très important)
 # ============================================================
-def load_audio(path: str, sr=22050, mono=True, max_seconds=30.0):
+def convert_to_wav(input_path: str, sr: int, max_seconds: float) -> str:
+    out_path = tempfile.mktemp(suffix=".wav")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", input_path,
+        "-t", str(float(max_seconds)),  # ✅ coupe tôt
+        "-ac", "1",
+        "-ar", str(int(sr)),
+        out_path,
+    ]
+    log(f"🎚️ ffmpeg -> wav: {' '.join(cmd)}")
+    try:
+        subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+    except Exception as e:
+        raise RuntimeError(f"ffmpeg convert failed: {e}")
+
+    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        raise RuntimeError("ffmpeg produced empty wav")
+    return out_path
+
+# ============================================================
+# Audio loading (always wav for stability)
+# ============================================================
+def load_audio(path: str, sr=DEFAULT_SR, mono=True, max_seconds=DEFAULT_MAX_SECONDS):
     import librosa
     y, sr = librosa.load(path, sr=sr, mono=mono)
     if max_seconds is not None:
-        y = y[: int(max_seconds * sr)]
+        y = y[: int(float(max_seconds) * sr)]
     return y, sr
 
 # ============================================================
@@ -54,7 +88,7 @@ def extract_melody_sig(
     y: np.ndarray,
     sr: int,
     *,
-    frames_per_sec=20,
+    frames_per_sec=MELODY_FPS,
     fmin=80.0,
     fmax=1000.0
 ):
@@ -62,23 +96,24 @@ def extract_melody_sig(
     Signature robuste humming:
       - extrait pitch (pyin)
       - normalise (invariant voix grave/aigue)
-      - convertit en "delta steps" (invariant transposition)
-      - quantifie en int8 (compact)
-    Retour:
-      melody_b64, shape=[T], meta
+      - delta steps (invariant transposition)
+      - quantifie int8
     """
     import librosa
 
     hop = int(sr / frames_per_sec)
-    hop = max(128, min(hop, 2048))
+    hop = max(256, min(hop, 2048))  # ✅ évite hops trop petits
 
     log(f"   A) pyin hop={hop} fps={frames_per_sec}")
 
     f0, voiced_flag, voiced_prob = librosa.pyin(
         y, fmin=fmin, fmax=fmax, sr=sr, hop_length=hop
     )
-    f0 = np.nan_to_num(f0, nan=0.0)
 
+    if f0 is None:
+        raise RuntimeError("pyin returned None")
+
+    f0 = np.nan_to_num(f0, nan=0.0)
     voiced = (f0 > 0.0).astype(np.float32)
 
     # Hz -> cents (log scale)
@@ -87,7 +122,7 @@ def extract_melody_sig(
     nz = f0 > 0
     cents[nz] = 1200.0 * np.log2(f0[nz] / ref)
 
-    # smoothing (reduce vibrato/pitch bends jitter)
+    # smoothing (reduce vibrato jitter)
     if cents.size >= 5:
         k = 5
         pad = k // 2
@@ -97,20 +132,20 @@ def extract_melody_sig(
             cents_sm[i] = np.median(cents_pad[i:i+k])
         cents = cents_sm
 
-    # Invariance to absolute pitch (grave/aigu): subtract median of voiced cents
+    # Invariance to absolute pitch: subtract median of voiced cents
     if np.any(nz):
         med = np.median(cents[nz])
         cents = cents - med
 
-    # delta contour (tempo handled by DTW later)
+    # delta contour
     dc = np.diff(cents, prepend=cents[:1])
     dc = np.clip(dc, -400.0, 400.0)
 
-    # quantize: 50 cents per unit => tolerant to pitch bends
+    # quantize: 50 cents per unit
     steps = np.rint(dc / 50.0).astype(np.int32)
     steps = np.clip(steps, -127, 127).astype(np.int8)
 
-    # unvoiced frames -> 0
+    # unvoiced -> 0
     steps = (steps.astype(np.int16) * voiced.astype(np.int16)).astype(np.int8)
 
     meta = {
@@ -131,31 +166,21 @@ def extract_chroma_sig(
     y: np.ndarray,
     sr: int,
     *,
-    frames_per_sec=4
+    frames_per_sec=CHROMA_FPS
 ):
-    """
-    Signature robuste chorale/bruit/harmonies:
-      - chroma CQT (T,12)
-      - normalisation par frame
-      - smoothing temporel
-      - quantification uint8 (compact)
-    Retour:
-      chroma_b64, shape=[T,12], meta
-    """
     import librosa
 
     hop = int(sr / frames_per_sec)
-    hop = max(128, min(hop, 4096))
+    hop = max(512, min(hop, 4096))  # ✅ plus gros hop => moins lourd
 
     log(f"   B) chroma_cqt hop={hop} fps={frames_per_sec}")
 
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)  # (12, T)
     chroma = chroma.T  # (T, 12)
 
-    # normalize per frame (robust volume/mic)
     chroma = chroma / (np.sum(chroma, axis=1, keepdims=True) + 1e-8)
 
-    # smoothing (helps noise/chorale)
+    # smoothing
     if chroma.shape[0] >= 5:
         k = 5
         pad = k // 2
@@ -165,7 +190,6 @@ def extract_chroma_sig(
             chroma_sm[t] = chroma_pad[t:t+k].mean(axis=0)
         chroma = chroma_sm
 
-    # quantize to uint8 for DB
     chroma_q = np.clip(np.rint(chroma * 255.0), 0, 255).astype(np.uint8)
 
     meta = {
@@ -181,10 +205,6 @@ def extract_chroma_sig(
 # DTW + scoring
 # ============================================================
 def dtw_distance(A: np.ndarray, B: np.ndarray, *, window=None) -> float:
-    """
-    DTW robuste (L1), normalisé.
-    A,B: (T,D) ou (T,)
-    """
     A = np.asarray(A)
     B = np.asarray(B)
 
@@ -221,10 +241,6 @@ def rotate_chroma(chroma_T12: np.ndarray, shift: int) -> np.ndarray:
     return np.roll(chroma_T12, shift=shift, axis=1)
 
 def score_chroma(query_chroma: np.ndarray, track_chroma: np.ndarray):
-    """
-    Tempo invariant via DTW, transposition invariant via 12 rotations.
-    Returns: (best_score, best_shift)
-    """
     q = np.asarray(query_chroma, dtype=np.float32)
     t = np.asarray(track_chroma, dtype=np.float32)
 
@@ -241,9 +257,6 @@ def score_chroma(query_chroma: np.ndarray, track_chroma: np.ndarray):
     return float(best), int(best_shift)
 
 def score_melody(query_steps: np.ndarray, track_steps: np.ndarray):
-    """
-    Pitch invariant already (relative delta), DTW handles tempo.
-    """
     q = np.asarray(query_steps, dtype=np.int16)
     t = np.asarray(track_steps, dtype=np.int16)
     w = int(max(q.shape[0], t.shape[0]) * 0.10) + 5
@@ -253,6 +266,7 @@ def score_melody(query_steps: np.ndarray, track_steps: np.ndarray):
 # MAIN
 # ============================================================
 def main():
+    wav_tmp = None
     try:
         payload = json.loads(sys.stdin.read() or "{}")
 
@@ -264,16 +278,24 @@ def main():
         if not audio_path:
             fail("audio_path is required")
 
-        sr = int(payload.get("sr", 22050))
-        max_seconds = float(payload.get("max_seconds", 30.0))
+        sr = int(payload.get("sr", DEFAULT_SR))
+        max_seconds = float(payload.get("max_seconds", DEFAULT_MAX_SECONDS))
 
-        log(f"🎧 Loading audio: {audio_path}")
-        y, sr = load_audio(audio_path, sr=sr, mono=True, max_seconds=max_seconds)
+        # ✅ force wav + CUT early (robust webm/opus)
+        log(f"🎧 Preparing audio: {audio_path}")
+        wav_tmp = convert_to_wav(audio_path, sr=sr, max_seconds=max_seconds)
+
+        log(f"🎧 Loading audio wav: {wav_tmp}")
+        y, sr = load_audio(wav_tmp, sr=sr, mono=True, max_seconds=max_seconds)
         log(f"✅ Loaded: {len(y)/sr:.2f}s @ sr={sr}")
 
-        # Always compute A + B
+        # Always compute A + B, but A may fail => fallback
         log("🧠 Extracting Option A (melodySig)...")
-        melody_b64, melody_shape, melody_meta = extract_melody_sig(y, sr)
+        try:
+            melody_b64, melody_shape, melody_meta = extract_melody_sig(y, sr)
+        except Exception as e:
+            log("⚠️ Melody extraction failed (fallback empty): " + str(e))
+            melody_b64, melody_shape, melody_meta = "", [0], {"type": "melody_failed", "error": str(e)}
 
         log("🎼 Extracting Option B (chromaSig)...")
         chroma_b64, chroma_shape, chroma_meta = extract_chroma_sig(y, sr)
@@ -296,7 +318,10 @@ def main():
             fail("query mode requires non-empty candidates list")
 
         # decode query
-        q_mel = b64_decode_int8(melody_b64, (melody_shape[0],))
+        q_mel = None
+        if melody_b64 and melody_shape and melody_shape[0] > 0:
+            q_mel = b64_decode_int8(melody_b64, (melody_shape[0],))
+
         q_chr = b64_decode_uint8(chroma_b64, (chroma_shape[0], 12)).astype(np.float32) / 255.0
 
         log(f"🔎 Matching against {len(candidates)} candidates...")
@@ -312,7 +337,7 @@ def main():
             s_chr = None
             best_shift = None
 
-            if tm.get("b64") and tm.get("shape"):
+            if q_mel is not None and tm.get("b64") and tm.get("shape") and tm["shape"][0] > 0:
                 t_mel = b64_decode_int8(tm["b64"], (tm["shape"][0],))
                 s_mel = score_melody(q_mel, t_mel)
 
@@ -323,7 +348,6 @@ def main():
             if s_mel is None and s_chr is None:
                 continue
 
-            # Fusion simple: meilleur des deux (tu ajusteras après)
             fused = min([x for x in [s_mel, s_chr] if x is not None])
 
             results.append({
@@ -354,6 +378,14 @@ def main():
         sys.stdout.write(json.dumps({"status": "error", "message": str(e)}))
         sys.stdout.flush()
         sys.exit(1)
+
+    finally:
+        if wav_tmp:
+            try:
+                os.unlink(wav_tmp)
+                log(f"🧹 Deleted temp wav: {wav_tmp}")
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()
