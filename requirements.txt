@@ -1,22 +1,26 @@
 fastapi==0.109.0
 uvicorn[standard]==0.25.0
+
 numpy==1.26.0
 scipy==1.11.0
+
 librosa==0.10.1
 soundfile==0.12.1
+audioread==3.0.1
+resampy==0.4.2
+pydub==0.25.1
+
 torch==2.1.0
+scikit-learn==1.4.2
+tqdm==4.66.4
+
 crepe==0.0.16
+fastdtw==0.3.4
 
-# AJOUTS (sans rien supprimer)
-audioread
-numba
-resampy
-pydub
-matplotlib
-scikit-learn
-tqdm
+numba==0.59.1
+llvmlite==0.42.0
 
-# 🔥 AJOUTS POUR FREDONNEMENT / DTW / STABILITÉ
-fastdtw          # comparaison mélodique (Dynamic Time Warping)
-setuptools<81    # évite le warning pkg_resources + compat librosa
-llvmlite         # backend de numba (souvent requis explicitement)
+matplotlib==3.8.4
+
+setuptools<81
+wheel
