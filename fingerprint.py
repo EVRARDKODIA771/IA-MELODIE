@@ -14,7 +14,7 @@ from typing import Optional, Dict, Any  # compat Python < 3.10
 # ============================================================
 TARGET_SR = 22050
 MAX_SECONDS_MAIN = 25.0      # ✅ limite dure pour le fingerprint global
-MAX_SECONDS_MATCH = 25.0     # ✅ limite dure pour la signature chroma DTW (qbh-like)
+MAX_SECONDS_MATCH = 25.0     # ✅ limite dure pour la signature chroma
 MAX_SECONDS_MELODY = 20.0    # ✅ limite dure pour melody signature (pyin)
 HOP_LENGTH = 512
 
@@ -65,16 +65,11 @@ def convert_to_wav(input_path: str, target_sr: int = TARGET_SR, max_seconds: flo
         "ffmpeg",
         "-y",
         "-hide_banner",
-        "-loglevel",
-        "error",
-        "-i",
-        input_path,
-        "-t",
-        str(float(max_seconds)),   # ✅ coupe tôt
-        "-ac",
-        "1",
-        "-ar",
-        str(target_sr),
+        "-loglevel", "error",
+        "-i", input_path,
+        "-t", str(float(max_seconds)),   # ✅ coupe tôt
+        "-ac", "1",
+        "-ar", str(int(target_sr)),
         out_path,
     ]
     try:
@@ -103,11 +98,19 @@ def convert_to_wav(input_path: str, target_sr: int = TARGET_SR, max_seconds: flo
         except Exception:
             pass
         return None
+    except Exception as e:
+        log("[fingerprint.py] ffmpeg exception: " + str(e))
+        try:
+            if os.path.exists(out_path):
+                os.unlink(out_path)
+        except Exception:
+            pass
+        return None
 
 # ============================================================
 # Helper: trim y to max_seconds
 # ============================================================
-def trim_audio(y, sr: int, max_seconds: float) :
+def trim_audio(y, sr: int, max_seconds: float):
     if max_seconds and max_seconds > 0:
         max_len = int(sr * float(max_seconds))
         if y is not None and getattr(y, "size", 0) > max_len:
@@ -116,30 +119,36 @@ def trim_audio(y, sr: int, max_seconds: float) :
 
 # ============================================================
 # 1) MATCH SIGNATURE (polyphonique) : chroma SEQUENCE compressée
-#    Optimisé: on accepte chroma déjà calculé pour éviter double compute.
+#    Optimisé: accepte chroma déjà calculé pour éviter double compute.
 # ============================================================
 def build_chroma_match_signature_from_chroma(chroma_12T, sr, *, hop_length=HOP_LENGTH, frames_per_sec=4, max_seconds=MAX_SECONDS_MATCH):
     import numpy as np
 
-    if chroma_12T is None or chroma_12T.size == 0:
+    if chroma_12T is None or getattr(chroma_12T, "size", 0) == 0:
         return [], [0, 12], {"match_ok": False, "reason": "empty_chroma"}
 
     log("[fingerprint.py] Building chroma match signature...")
 
     eps = 1e-9
     chroma = chroma_12T.astype(np.float32)
+
+    # chroma_12T = (12, T). Normalize over pitch classes per frame (sum over 12).
     chroma = chroma / (np.sum(chroma, axis=0, keepdims=True) + eps)
 
-    fps_actual = sr / hop_length
+    # downsample frames to target fps
+    fps_actual = sr / float(hop_length)
     target_fps = float(frames_per_sec) if frames_per_sec and frames_per_sec > 0 else 4.0
     step = int(max(1, round(fps_actual / target_fps)))
 
-    chroma_ds = chroma[:, ::step]
+    chroma_ds = chroma[:, ::step]  # (12, T')
     T = chroma_ds.shape[1]
-    if T == 0:
+    if T <= 0:
         return [], [0, 12], {"match_ok": False, "reason": "downsampled_empty"}
 
+    # quantize to uint8 0..127
     q = np.clip(np.round(chroma_ds * 127.0), 0, 127).astype(np.uint8)
+
+    # store as (T,12) flatten
     q_T12 = q.T
     flat = q_T12.reshape(-1)
 
@@ -165,6 +174,7 @@ def build_melody_signature(y, sr, *, hop_length=HOP_LENGTH, n_points=120, max_se
 
     y = trim_audio(y, sr, max_seconds)
 
+    # safer bounds for vocals/instruments humming
     fmin = librosa.note_to_hz("C2")
     fmax = librosa.note_to_hz("C6")
 
@@ -182,14 +192,14 @@ def build_melody_signature(y, sr, *, hop_length=HOP_LENGTH, n_points=120, max_se
 
     midi = librosa.hz_to_midi(f0)
     voiced = (midi == midi)  # NaN-safe
-    voiced_ratio = float(sum(voiced) / len(voiced)) if len(voiced) else 0.0
+    voiced_ratio = float(voiced.sum() / len(voiced)) if len(voiced) else 0.0
 
     if voiced_ratio < 0.08:
         return [], {"melody_ok": False, "reason": "too_few_voiced_frames", "voiced_ratio": voiced_ratio}
 
     midi_v = midi[voiced].astype(float)
 
-    # median filter
+    # median filter (reduce jitter)
     if len(midi_v) >= 7:
         k = 7
         pad = k // 2
@@ -205,8 +215,8 @@ def build_melody_signature(y, sr, *, hop_length=HOP_LENGTH, n_points=120, max_se
     if intervals.size == 0:
         return [], {"melody_ok": False, "reason": "intervals_empty", "voiced_ratio": voiced_ratio}
 
-    intervals = np.clip(intervals, -12.0, 12.0)
-    q_int = np.round(intervals * 10.0).astype(np.int16)
+    intervals = np.clip(intervals, -12.0, 12.0)   # clip 1 octave
+    q_int = np.round(intervals * 10.0).astype(np.int16)  # semitone * 10
 
     L = q_int.size
     if L >= n_points:
@@ -290,8 +300,8 @@ def main():
         mfcc_mean = np.mean(mfcc, axis=1)
         mfcc_std = np.std(mfcc, axis=1)
 
-        onset_mean = float(np.mean(onset_env)) if onset_env.size else 0.0
-        onset_std  = float(np.std(onset_env)) if onset_env.size else 0.0
+        onset_mean = float(np.mean(onset_env)) if getattr(onset_env, "size", 0) else 0.0
+        onset_std  = float(np.std(onset_env)) if getattr(onset_env, "size", 0) else 0.0
 
         vec = np.concatenate([
             chroma_mean, chroma_std,
@@ -308,7 +318,7 @@ def main():
             chroma, sr, hop_length=HOP_LENGTH, frames_per_sec=4, max_seconds=MAX_SECONDS_MATCH
         )
 
-        # melody signature (pyin) - peut être lourd, mais limité à MAX_SECONDS_MELODY
+        # melody signature (pyin) - limité à MAX_SECONDS_MELODY
         melody_sig, melody_meta = build_melody_signature(
             y, sr, hop_length=HOP_LENGTH, n_points=120, max_seconds=MAX_SECONDS_MELODY
         )
@@ -321,9 +331,9 @@ def main():
             "fingerprint": fingerprint,
             "fingerprint_short": short_fp,
             "meta": {
-                "sr": sr,
-                "duration_sec": duration,
-                "tempo_bpm_est": tempo,
+                "sr": int(sr),
+                "duration_sec": float(duration),
+                "tempo_bpm_est": float(tempo),
                 "vector_dim": int(q.shape[0]),
                 "quant_scale": 1000.0,
                 "used_ffmpeg_wav": bool(wav_tmp),
