@@ -1,5 +1,5 @@
-// server.js (UPDATED: anti-numba / anti-sigsegv + env forcé sur CHAQUE spawn python)
-// ✅ Ce fichier remplace ton ancien server.js
+// server.js (UPDATED: stable numba + anti-thread-crash + env forcé sur CHAQUE spawn python)
+// ✅ Remplace ton server.js par celui-ci
 
 import express from "express";
 import multer from "multer";
@@ -78,15 +78,23 @@ const pythonQbhPath = path.join(__dirname, "qbh_engine.py");
 const API_TOKEN = "3523e792bbced184caa4f51a33a2494a";
 
 // =========================
-// SAFE PY ENV (ANTI NUMBA / ANTI SIGSEGV)
+// SAFE PY ENV (STABLE NUMBA + ANTI THREAD CRASH)
 // =========================
 // ⚠️ IMPORTANT: on force cet env sur TOUS les spawn python, y compris melody/upload
+const NUMBA_CACHE_DIR = "/tmp/numba_cache";
+try {
+  fs.mkdirSync(NUMBA_CACHE_DIR, { recursive: true });
+} catch {}
+
 const SAFE_PY_ENV = {
   ...process.env,
 
-  // ✅ désactive JIT numba (librosa → numba → crash / incompat)
-  NUMBA_DISABLE_JIT: "1",
-  NUMBA_CACHE_DIR: "/tmp",
+  // ❌ NE PAS mettre NUMBA_DISABLE_JIT=1 (ça peut casser QBH avec des fonctions numba)
+  // NUMBA_DISABLE_JIT: "1",
+
+  // ✅ Numba: garder JIT mais contrôler ressources
+  NUMBA_NUM_THREADS: "1",
+  NUMBA_CACHE_DIR: NUMBA_CACHE_DIR,
 
   // ✅ limite threads BLAS/OMP (crash sur petits containers)
   OMP_NUM_THREADS: "1",
@@ -368,7 +376,7 @@ app.post("/melody/upload", upload.single("file"), async (req, res) => {
 
   console.log("📥 Audio reçu (Python) :", req.file.originalname);
 
-  // ✅ IMPORTANT: env SAFE_PY_ENV (anti-numba)
+  // ✅ IMPORTANT: env SAFE_PY_ENV (stable numba)
   const py = spawn("python3", [pythonFingerprintPath, filePath], { env: SAFE_PY_ENV });
 
   let stdoutData = "";
