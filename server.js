@@ -69,10 +69,30 @@ const upload = multer({
 // =========================
 // Python scripts
 // =========================
-const pythonFingerprintPath = path.join(__dirname, "fingerprint.py"); // EXISTANT
-const pythonQbhPath = path.join(__dirname, "qbh_engine.py"); // NOUVEAU
+const pythonFingerprintPath = path.join(__dirname, "fingerprint.py");
+const pythonQbhPath = path.join(__dirname, "qbh_engine.py");
 
 const API_TOKEN = "3523e792bbced184caa4f51a33a2494a";
+
+// =========================
+// SAFE PY ENV (ANTI SIGSEGV)
+// =========================
+const SAFE_PY_ENV = {
+  ...process.env,
+
+  // ✅ évite numba/llvmlite JIT (cause fréquente de SIGSEGV)
+  NUMBA_DISABLE_JIT: "1",
+
+  // ✅ évite crashs BLAS multi-thread sur petits containers
+  OMP_NUM_THREADS: "1",
+  OPENBLAS_NUM_THREADS: "1",
+  MKL_NUM_THREADS: "1",
+  VECLIB_MAXIMUM_THREADS: "1",
+  NUMEXPR_NUM_THREADS: "1",
+
+  // ✅ limite la fragmentation mémoire
+  MALLOC_ARENA_MAX: "2",
+};
 
 // =========================
 // Stockage résultats par jobId
@@ -166,14 +186,14 @@ async function downloadToFile(url, destPath, jobId) {
 }
 
 // =========================
-// Python runner (EXISTANT fingerprint.py)
+// Python runner (fingerprint.py)
 // =========================
 function runPythonFingerprint(filePath, jobId) {
   return new Promise((resolve, reject) => {
     pushLog(jobId, `Lancement Python: python3 ${pythonFingerprintPath} ${filePath}`);
 
     const py = spawn("python3", [pythonFingerprintPath, filePath], {
-      env: { ...process.env },
+      env: SAFE_PY_ENV,
     });
 
     let stdout = "";
@@ -195,7 +215,6 @@ function runPythonFingerprint(filePath, jobId) {
       reject(err);
     });
 
-    // ✅ FIX: close => (code, signal)
     py.on("close", (code, signal) => {
       pushLog(jobId, `Python terminé avec code=${code} signal=${signal || "none"}`);
 
@@ -221,14 +240,14 @@ function runPythonFingerprint(filePath, jobId) {
 }
 
 // =========================
-// Python runner (NOUVEAU qbh_engine.py via stdin JSON)
+// Python runner (qbh_engine.py via stdin JSON)
 // =========================
 function runPythonQBH(payload, jobId) {
   return new Promise((resolve, reject) => {
     pushLog(jobId, `Lancement QBH: python3 ${pythonQbhPath} (mode=${payload?.mode})`);
 
     const py = spawn("python3", [pythonQbhPath], {
-      env: { ...process.env },
+      env: SAFE_PY_ENV,
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -251,7 +270,6 @@ function runPythonQBH(payload, jobId) {
       reject(err);
     });
 
-    // ✅ FIX: close => (code, signal)
     py.on("close", (code, signal) => {
       pushLog(jobId, `QBH terminé avec code=${code} signal=${signal || "none"}`);
 
@@ -274,7 +292,6 @@ function runPythonQBH(payload, jobId) {
       }
     });
 
-    // send payload via stdin
     try {
       py.stdin.write(JSON.stringify(payload));
       py.stdin.end();
@@ -302,7 +319,7 @@ app.get("/debug/echo", (req, res) => {
 app.get("/ping", (_req, res) => res.json({ status: "ok", message: "Backend awake" }));
 
 // =========================
-// 1) Melody (AUdD) (INCHANGÉ)
+// 1) Melody (AUdD) (inchangé logique, spawn python sécurisé)
 // =========================
 app.post("/melody/upload", upload.single("file"), async (req, res) => {
   console.log("✅ HIT /melody/upload", "origin=", req.headers.origin, "jobId=", req.body?.jobId);
@@ -345,7 +362,10 @@ app.post("/melody/upload", upload.single("file"), async (req, res) => {
   }
 
   console.log("📥 Audio reçu (Python) :", req.file.originalname);
-  const py = spawn("python3", [pythonFingerprintPath, filePath]); // on garde comme avant
+
+  // ✅ spawn python avec SAFE_PY_ENV
+  const py = spawn("python3", [pythonFingerprintPath, filePath], { env: SAFE_PY_ENV });
+
   let stdoutData = "";
   let stderrData = "";
 
@@ -388,7 +408,7 @@ app.get("/melody/result/:jobId", (req, res) => {
 });
 
 // =========================
-// 2) Fingerprint generic (INCHANGÉ)
+// 2) Fingerprint generic
 // =========================
 app.post("/fingerprint/url", async (req, res) => {
   const { url, jobId } = req.body;
@@ -513,27 +533,12 @@ app.get("/fingerprint/:jobId", (req, res) => {
   resultsByJobId[jobId] = job;
 
   if (job.status === "done") {
-    return res.json({
-      status: "done",
-      jobId,
-      resultUrl: `/fingerprint/result/${jobId}`,
-    });
+    return res.json({ status: "done", jobId, resultUrl: `/fingerprint/result/${jobId}` });
   }
-
   if (job.status === "error") {
-    return res.json({
-      status: "error",
-      jobId,
-      message: job.error || "Erreur inconnue",
-      resultUrl: `/fingerprint/result/${jobId}`,
-    });
+    return res.json({ status: "error", jobId, message: job.error || "Erreur inconnue", resultUrl: `/fingerprint/result/${jobId}` });
   }
-
-  return res.json({
-    status: job.status,
-    jobId,
-    resultUrl: `/fingerprint/result/${jobId}`,
-  });
+  return res.json({ status: job.status, jobId, resultUrl: `/fingerprint/result/${jobId}` });
 });
 
 app.get("/fingerprint/result/:jobId", (req, res) => {
@@ -545,13 +550,8 @@ app.get("/fingerprint/result/:jobId", (req, res) => {
   resultsByJobId[jobId] = job;
 
   if (job.status === "done") {
-    return res.json({
-      status: "done",
-      jobId,
-      ...job.result,
-    });
+    return res.json({ status: "done", jobId, ...job.result });
   }
-
   if (job.status === "error") {
     return res.status(500).json({
       status: "error",
@@ -560,12 +560,7 @@ app.get("/fingerprint/result/:jobId", (req, res) => {
       logsTail: (job.logs || []).slice(-30),
     });
   }
-
-  return res.status(202).json({
-    status: job.status,
-    jobId,
-    message: "Pas prêt",
-  });
+  return res.status(202).json({ status: job.status, jobId, message: "Pas prêt" });
 });
 
 app.get("/fingerprint/logs/:jobId", (req, res) => {
@@ -578,10 +573,9 @@ app.get("/fingerprint/logs/:jobId", (req, res) => {
 });
 
 // ============================================================
-// 4) QBH (Option A + Option B) - NOUVELLES ROUTES
+// 4) QBH routes
 // ============================================================
 
-// helper: parse candidates JSON (string ou objet)
 function parseCandidates(raw) {
   if (!raw) return [];
   if (Array.isArray(raw)) return raw;
@@ -624,17 +618,12 @@ app.post("/qbh/index/upload", upload.single("file"), async (req, res) => {
 
   (async () => {
     try {
-      const payload = {
-        mode: "index",
-        audio_path: filePath,
-        sr: 22050,
-        max_seconds: 30,
-      };
+      const payload = { mode: "index", audio_path: filePath, sr: 22050, max_seconds: 12 };
       const result = await runPythonQBH(payload, jobId);
 
       const j = ensureJob(jobId);
       j.status = "done";
-      j.result = result; // contient melodySig + chromaSig
+      j.result = result;
       j.error = null;
       saveJob(jobId);
       pushLog(jobId, "QBH INDEX terminé ✅");
@@ -680,13 +669,7 @@ app.post("/qbh/index/url", async (req, res) => {
   (async () => {
     try {
       await downloadToFile(url, tmpFile, jobId);
-
-      const payload = {
-        mode: "index",
-        audio_path: tmpFile,
-        sr: 22050,
-        max_seconds: 30,
-      };
+      const payload = { mode: "index", audio_path: tmpFile, sr: 22050, max_seconds: 12 };
       const result = await runPythonQBH(payload, jobId);
 
       const j = ensureJob(jobId);
@@ -746,13 +729,13 @@ app.post("/qbh/query/upload", upload.single("file"), async (req, res) => {
         candidates,
         top_k: 10,
         sr: 22050,
-        max_seconds: 15, // query plus court = mieux pour latence
+        max_seconds: 12,
       };
       const result = await runPythonQBH(payload, jobId);
 
       const j = ensureJob(jobId);
       j.status = "done";
-      j.result = result; // top matches
+      j.result = result;
       j.error = null;
       saveJob(jobId);
       pushLog(jobId, "QBH QUERY terminé ✅");
@@ -808,7 +791,7 @@ app.post("/qbh/query/url", async (req, res) => {
         candidates: cand,
         top_k: 10,
         sr: 22050,
-        max_seconds: 15,
+        max_seconds: 12,
       };
       const result = await runPythonQBH(payload, jobId);
 
