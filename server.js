@@ -1,3 +1,6 @@
+// server.js (UPDATED: anti-numba / anti-sigsegv + env forcé sur CHAQUE spawn python)
+// ✅ Ce fichier remplace ton ancien server.js
+
 import express from "express";
 import multer from "multer";
 import fs from "fs";
@@ -75,22 +78,24 @@ const pythonQbhPath = path.join(__dirname, "qbh_engine.py");
 const API_TOKEN = "3523e792bbced184caa4f51a33a2494a";
 
 // =========================
-// SAFE PY ENV (ANTI SIGSEGV)
+// SAFE PY ENV (ANTI NUMBA / ANTI SIGSEGV)
 // =========================
+// ⚠️ IMPORTANT: on force cet env sur TOUS les spawn python, y compris melody/upload
 const SAFE_PY_ENV = {
   ...process.env,
 
-  // ✅ évite numba/llvmlite JIT (cause fréquente de SIGSEGV)
+  // ✅ désactive JIT numba (librosa → numba → crash / incompat)
   NUMBA_DISABLE_JIT: "1",
+  NUMBA_CACHE_DIR: "/tmp",
 
-  // ✅ évite crashs BLAS multi-thread sur petits containers
+  // ✅ limite threads BLAS/OMP (crash sur petits containers)
   OMP_NUM_THREADS: "1",
   OPENBLAS_NUM_THREADS: "1",
   MKL_NUM_THREADS: "1",
   VECLIB_MAXIMUM_THREADS: "1",
   NUMEXPR_NUM_THREADS: "1",
 
-  // ✅ limite la fragmentation mémoire
+  // ✅ limite fragmentation mémoire
   MALLOC_ARENA_MAX: "2",
 };
 
@@ -363,7 +368,7 @@ app.post("/melody/upload", upload.single("file"), async (req, res) => {
 
   console.log("📥 Audio reçu (Python) :", req.file.originalname);
 
-  // ✅ spawn python avec SAFE_PY_ENV
+  // ✅ IMPORTANT: env SAFE_PY_ENV (anti-numba)
   const py = spawn("python3", [pythonFingerprintPath, filePath], { env: SAFE_PY_ENV });
 
   let stdoutData = "";
@@ -536,7 +541,12 @@ app.get("/fingerprint/:jobId", (req, res) => {
     return res.json({ status: "done", jobId, resultUrl: `/fingerprint/result/${jobId}` });
   }
   if (job.status === "error") {
-    return res.json({ status: "error", jobId, message: job.error || "Erreur inconnue", resultUrl: `/fingerprint/result/${jobId}` });
+    return res.json({
+      status: "error",
+      jobId,
+      message: job.error || "Erreur inconnue",
+      resultUrl: `/fingerprint/result/${jobId}`,
+    });
   }
   return res.json({ status: job.status, jobId, resultUrl: `/fingerprint/result/${jobId}` });
 });
