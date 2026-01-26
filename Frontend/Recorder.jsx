@@ -39,13 +39,12 @@ export default function Recorder() {
   const formatTime = (s) =>
     `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 
-  const pollJob = async (pollJobId, { interval = 1500, timeout = 120000 } = {}) => {
+  const pollJob = async (pollJobId, basePath, { interval = 1500, timeout = 120000 } = {}) => {
     const start = Date.now();
-
     while (true) {
       if (Date.now() - start > timeout) throw new Error("Timeout polling");
 
-      const r = await fetch(`${apiUrl}/fingerprint/${pollJobId}`, { cache: "no-store" });
+      const r = await fetch(`${apiUrl}${basePath}/${pollJobId}`, { cache: "no-store" });
       const data = await r.json();
 
       if (data.status === "done") return data;
@@ -127,28 +126,50 @@ export default function Recorder() {
   const sendAudio = async (blob, baseJobId) => {
     if (!blob || !baseJobId) return;
 
+    // =========================
+    // AUdD (inchangé)
+    // =========================
     const fdAudd = new FormData();
     fdAudd.append("file", blob, "recording.webm");
     fdAudd.append("jobId", baseJobId);
 
-    const humJobId = `${baseJobId}-hum`;
-    const fdHum = new FormData();
-    fdHum.append("file", blob, "recording.webm");
-    fdHum.append("jobId", humJobId);
-
     const auddUploadUrl = `${apiUrl}/melody/upload?backend=audd`;
-    const humUploadUrl = `${apiUrl}/fingerprint/hum/upload`;
+
+    // =========================
+    // Fingerprint local (Python) -> Wix DB match ensuite
+    // =========================
+    const fpJobId = `${baseJobId}-fp`;
+    const fdFp = new FormData();
+    fdFp.append("file", blob, "recording.webm");
+    fdFp.append("jobId", fpJobId);
+
+    const fpUploadUrl = `${apiUrl}/fingerprint/upload`;
+
+    // =========================
+    // QBH (feature/index) en parallèle
+    // =========================
+    const qbhJobId = `${baseJobId}-qbh`;
+    const fdQbh = new FormData();
+    fdQbh.append("file", blob, "recording.webm");
+    fdQbh.append("jobId", qbhJobId);
+
+    const qbhUploadUrl = `${apiUrl}/qbh/index/upload`;
 
     console.log("➡️ AUdD upload =>", auddUploadUrl, baseJobId);
-    console.log("➡️ HUM upload  =>", humUploadUrl, humJobId);
+    console.log("➡️ FP   upload =>", fpUploadUrl, fpJobId);
+    console.log("➡️ QBH  upload =>", qbhUploadUrl, qbhJobId);
 
-    setStatus("🧠 Envoi AUdD + HUM en parallèle...");
+    setStatus("🧠 Envoi AUdD + Fingerprint + QBH en parallèle...");
 
-    const [auddSettled, humSettled] = await Promise.allSettled([
+    const [auddSettled, fpSettled, qbhSettled] = await Promise.allSettled([
       fetch(auddUploadUrl, { method: "POST", body: fdAudd }),
-      fetch(humUploadUrl, { method: "POST", body: fdHum }),
+      fetch(fpUploadUrl, { method: "POST", body: fdFp }),
+      fetch(qbhUploadUrl, { method: "POST", body: fdQbh }),
     ]);
 
+    // -------------------------
+    // AUdD result (inchangé)
+    // -------------------------
     let auddOk = false;
     let auddResultUrl = null;
     let auddUploadInfo = null;
@@ -169,94 +190,157 @@ export default function Recorder() {
       auddUploadInfo = { error: String(auddSettled.reason) };
     }
 
-    let humOk = false;
-    let humResultUrl = `${apiUrl}/fingerprint/result/${humJobId}`;
-    let humLogsUrl = `${apiUrl}/fingerprint/logs/${humJobId}`;
-    let humUploadInfo = null;
+    // -------------------------
+    // Fingerprint polling + fetch final JSON
+    // -------------------------
+    let fpOk = false;
+    let fpResultUrl = `${apiUrl}/fingerprint/result/${fpJobId}`;
+    let fpLogsUrl = `${apiUrl}/fingerprint/logs/${fpJobId}`;
+    let fpUploadInfo = null;
 
-    let humSignatureOk = false;
-    let humMelodyHash = null;
-    let humVoicedRatio = null;
-    let humSignatureLen = null;
+    // ce que Wix va utiliser pour matcher DB :
+    let fpMelodyHash = null;      // ex: hash stable de la signature
+    let fpSignatureOk = false;    // ex: melody_ok
+    let fpSignatureLen = null;
+    let fpVoicedRatio = null;
 
-    if (humSettled.status === "fulfilled") {
-      const res = humSettled.value;
+    if (fpSettled.status === "fulfilled") {
+      const res = fpSettled.value;
       const json = await readJsonSafe(res);
-      humUploadInfo = { ok: res.ok, status: res.status, json };
+      fpUploadInfo = { ok: res.ok, status: res.status, json };
 
       if (res.ok) {
-        humOk = true;
+        fpOk = true;
 
-        // si le backend renvoie logsUrl/resultUrl, on les utilise
-        if (json?.resultUrl) humResultUrl = `${apiUrl}${json.resultUrl}`;
-        if (json?.logsUrl) humLogsUrl = `${apiUrl}${json.logsUrl}`;
+        // si backend renvoie resultUrl/logsUrl
+        if (json?.resultUrl) fpResultUrl = `${apiUrl}${json.resultUrl}`;
+        if (json?.logsUrl) fpLogsUrl = `${apiUrl}${json.logsUrl}`;
 
         try {
-          const pollData = await pollJob(humJobId);
-          const finalUrl = pollData?.resultUrl ? `${apiUrl}${pollData.resultUrl}` : humResultUrl;
+          const pollData = await pollJob(fpJobId, "/fingerprint");
+          const finalUrl = pollData?.resultUrl ? `${apiUrl}${pollData.resultUrl}` : fpResultUrl;
 
           const finalRes = await fetch(finalUrl, { cache: "no-store" });
           const finalJson = await finalRes.json();
 
-          humResultUrl = finalUrl;
+          fpResultUrl = finalUrl;
 
+          // 👉 Ici on suppose que fingerprint.py renvoie un bloc "melody"
+          //    (comme ton ancien code HUM). Si ton JSON est différent,
+          //    adapte juste ces champs.
           const melody = finalJson?.melody || null;
-          humSignatureOk = Boolean(melody?.melody_ok);
-          humMelodyHash = melody?.melody_hash || null;
-          humVoicedRatio = melody?.voiced_ratio ?? null;
-          if (Array.isArray(melody?.signature)) humSignatureLen = melody.signature.length;
+          fpSignatureOk = Boolean(melody?.melody_ok);
+          fpMelodyHash = melody?.melody_hash || null;
+          fpVoicedRatio = melody?.voiced_ratio ?? null;
+          if (Array.isArray(melody?.signature)) fpSignatureLen = melody.signature.length;
         } catch (e) {
-          humOk = false;
-          console.error("HUM polling/fetch error:", e);
+          fpOk = false;
+          console.error("FP polling/fetch error:", e);
         }
       } else {
-        console.error("HUM HTTP error:", res.status, json);
+        console.error("FP HTTP error:", res.status, json);
       }
     } else {
-      console.error("HUM error:", humSettled.reason);
-      humUploadInfo = { error: String(humSettled.reason) };
+      console.error("FP error:", fpSettled.reason);
+      fpUploadInfo = { error: String(fpSettled.reason) };
     }
 
-    if (auddOk && humOk) setStatus("✅ AUdD + HUM terminés");
-    else if (auddOk) setStatus("⚠️ AUdD OK, HUM échoué");
-    else if (humOk) setStatus("⚠️ HUM OK, AUdD échoué");
-    else setStatus("❌ AUdD + HUM échoués");
+    // -------------------------
+    // QBH polling + fetch final JSON
+    // -------------------------
+    let qbhOk = false;
+    let qbhResultUrl = `${apiUrl}/qbh/result/${qbhJobId}`;
+    let qbhLogsUrl = `${apiUrl}/qbh/logs/${qbhJobId}`;
+    let qbhUploadInfo = null;
+
+    if (qbhSettled.status === "fulfilled") {
+      const res = qbhSettled.value;
+      const json = await readJsonSafe(res);
+      qbhUploadInfo = { ok: res.ok, status: res.status, json };
+
+      if (res.ok) {
+        qbhOk = true;
+
+        if (json?.resultUrl) qbhResultUrl = `${apiUrl}${json.resultUrl}`;
+        if (json?.logsUrl) qbhLogsUrl = `${apiUrl}${json.logsUrl}`;
+
+        try {
+          const pollData = await pollJob(qbhJobId, "/qbh");
+          const finalUrl = pollData?.resultUrl ? `${apiUrl}${pollData.resultUrl}` : qbhResultUrl;
+          qbhResultUrl = finalUrl;
+        } catch (e) {
+          qbhOk = false;
+          console.error("QBH polling error:", e);
+        }
+      } else {
+        console.error("QBH HTTP error:", res.status, json);
+      }
+    } else {
+      console.error("QBH error:", qbhSettled.reason);
+      qbhUploadInfo = { error: String(qbhSettled.reason) };
+    }
+
+    // -------------------------
+    // Status global
+    // -------------------------
+    const okCount = [auddOk, fpOk, qbhOk].filter(Boolean).length;
+    if (okCount === 3) setStatus("✅ AUdD + Fingerprint + QBH terminés");
+    else if (okCount >= 1) setStatus(`⚠️ Partiel (${okCount}/3) : voir détails`);
+    else setStatus("❌ Tout a échoué");
 
     const out = {
       jobId: baseJobId,
+
+      // AUdD
       auddUploadUrl,
       auddResultUrl,
       auddUploadInfo,
 
-      humJobId,
-      humUploadUrl,
-      humResultUrl,
-      humLogsUrl,
-      humUploadInfo,
+      // Fingerprint (pour match Wix DB)
+      fpJobId,
+      fpUploadUrl,
+      fpResultUrl,
+      fpLogsUrl,
+      fpUploadInfo,
+      fpSignatureOk,
+      fpMelodyHash,
+      fpVoicedRatio,
+      fpSignatureLen,
 
-      humSignatureOk,
-      humMelodyHash,
-      humVoicedRatio,
-      humSignatureLen,
+      // QBH
+      qbhJobId,
+      qbhUploadUrl,
+      qbhResultUrl,
+      qbhLogsUrl,
+      qbhUploadInfo,
     };
+
     setResult(out);
 
+    // -------------------------
     // Retour Wix
+    // -------------------------
     if (returnUrl) {
       try {
         const wixUrl = new URL(decodeURIComponent(returnUrl));
         wixUrl.searchParams.set("jobId", baseJobId);
 
+        // AUdD
         if (auddResultUrl) wixUrl.searchParams.set("resultUrl", auddResultUrl);
 
-        wixUrl.searchParams.set("humJobId", humJobId);
-        wixUrl.searchParams.set("humResultUrl", humResultUrl);
-        wixUrl.searchParams.set("humLogsUrl", humLogsUrl);
+        // Fingerprint
+        wixUrl.searchParams.set("fpJobId", fpJobId);
+        wixUrl.searchParams.set("fpResultUrl", fpResultUrl);
+        wixUrl.searchParams.set("fpLogsUrl", fpLogsUrl);
+        wixUrl.searchParams.set("fpSignatureOk", String(fpSignatureOk));
+        if (fpMelodyHash) wixUrl.searchParams.set("fpMelodyHash", fpMelodyHash);
+        if (fpVoicedRatio != null) wixUrl.searchParams.set("fpVoicedRatio", String(fpVoicedRatio));
+        if (fpSignatureLen != null) wixUrl.searchParams.set("fpSignatureLen", String(fpSignatureLen));
 
-        wixUrl.searchParams.set("humSignatureOk", String(humSignatureOk));
-        if (humMelodyHash) wixUrl.searchParams.set("humMelodyHash", humMelodyHash);
-        if (humVoicedRatio != null) wixUrl.searchParams.set("humVoicedRatio", String(humVoicedRatio));
-        if (humSignatureLen != null) wixUrl.searchParams.set("humSignatureLen", String(humSignatureLen));
+        // QBH
+        wixUrl.searchParams.set("qbhJobId", qbhJobId);
+        wixUrl.searchParams.set("qbhResultUrl", qbhResultUrl);
+        wixUrl.searchParams.set("qbhLogsUrl", qbhLogsUrl);
 
         window.location.href = wixUrl.toString();
       } catch (err) {
@@ -289,10 +373,12 @@ export default function Recorder() {
         <div className="result">
           <p><b>JobID :</b> {result.jobId}</p>
 
-          <p><b>AUdD upload :</b> {result.auddUploadUrl}</p>
+          <hr />
+          <h4>AUdD</h4>
+          <p><b>Upload :</b> {result.auddUploadUrl}</p>
           {result.auddResultUrl && (
             <p>
-              <b>AUdD résultat :</b>{" "}
+              <b>Résultat :</b>{" "}
               <a href={result.auddResultUrl} target="_blank" rel="noopener noreferrer">
                 {result.auddResultUrl}
               </a>
@@ -303,31 +389,47 @@ export default function Recorder() {
           </pre>
 
           <hr />
-
-          <p><b>HUM JobID :</b> {result.humJobId}</p>
-          <p><b>HUM upload :</b> {result.humUploadUrl}</p>
-
+          <h4>Fingerprint (pour DB Wix)</h4>
+          <p><b>fpJobId :</b> {result.fpJobId}</p>
+          <p><b>Upload :</b> {result.fpUploadUrl}</p>
           <p>
-            <b>HUM JSON :</b>{" "}
-            <a href={result.humResultUrl} target="_blank" rel="noopener noreferrer">
-              {result.humResultUrl}
+            <b>JSON :</b>{" "}
+            <a href={result.fpResultUrl} target="_blank" rel="noopener noreferrer">
+              {result.fpResultUrl}
             </a>
           </p>
-
           <p>
-            <b>HUM logs :</b>{" "}
-            <a href={result.humLogsUrl} target="_blank" rel="noopener noreferrer">
-              {result.humLogsUrl}
+            <b>Logs :</b>{" "}
+            <a href={result.fpLogsUrl} target="_blank" rel="noopener noreferrer">
+              {result.fpLogsUrl}
             </a>
           </p>
-
-          <p>HUM melody_ok : <b>{String(result.humSignatureOk)}</b></p>
-          {result.humMelodyHash && <p>HUM melody_hash : <b>{result.humMelodyHash}</b></p>}
-          {result.humVoicedRatio != null && <p>HUM voiced_ratio : <b>{String(result.humVoicedRatio)}</b></p>}
-          {result.humSignatureLen != null && <p>HUM signature_len : <b>{String(result.humSignatureLen)}</b></p>}
-
+          <p>melody_ok : <b>{String(result.fpSignatureOk)}</b></p>
+          {result.fpMelodyHash && <p>melody_hash : <b>{result.fpMelodyHash}</b></p>}
+          {result.fpVoicedRatio != null && <p>voiced_ratio : <b>{String(result.fpVoicedRatio)}</b></p>}
+          {result.fpSignatureLen != null && <p>signature_len : <b>{String(result.fpSignatureLen)}</b></p>}
           <pre style={{ whiteSpace: "pre-wrap" }}>
-            {JSON.stringify(result.humUploadInfo, null, 2)}
+            {JSON.stringify(result.fpUploadInfo, null, 2)}
+          </pre>
+
+          <hr />
+          <h4>QBH</h4>
+          <p><b>qbhJobId :</b> {result.qbhJobId}</p>
+          <p><b>Upload :</b> {result.qbhUploadUrl}</p>
+          <p>
+            <b>JSON :</b>{" "}
+            <a href={result.qbhResultUrl} target="_blank" rel="noopener noreferrer">
+              {result.qbhResultUrl}
+            </a>
+          </p>
+          <p>
+            <b>Logs :</b>{" "}
+            <a href={result.qbhLogsUrl} target="_blank" rel="noopener noreferrer">
+              {result.qbhLogsUrl}
+            </a>
+          </p>
+          <pre style={{ whiteSpace: "pre-wrap" }}>
+            {JSON.stringify(result.qbhUploadInfo, null, 2)}
           </pre>
         </div>
       )}
