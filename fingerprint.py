@@ -13,10 +13,15 @@ from typing import Optional, Dict, Any  # compat Python < 3.10
 # CONFIG (IMPORTANT: évite OOM / timeout sur Render)
 # ============================================================
 TARGET_SR = 22050
-MAX_SECONDS_MAIN = 25.0      # ✅ limite dure pour le fingerprint global
-MAX_SECONDS_MATCH = 25.0     # ✅ limite dure pour la signature chroma
-MAX_SECONDS_MELODY = 20.0    # ✅ limite dure pour melody signature (pyin)
 HOP_LENGTH = 512
+
+# ✅ mode "full" (comme aujourd'hui)
+MAX_SECONDS_MAIN = 25.0      # fingerprint global
+MAX_SECONDS_MATCH = 25.0     # signature chroma (match polyphonique)
+MAX_SECONDS_MELODY = 20.0    # melody signature (pyin)
+
+# ✅ mode "hum" / "short" (Recorder: ~7s)
+MAX_SECONDS_HUM = 8.0        # coupe courte pour 7s recorder (+ marge)
 
 # ----------------------------
 # Logging: stderr only
@@ -53,9 +58,45 @@ def fail(msg: str, *, code: int = 1, extra: Optional[Dict[str, Any]] = None):
     return code
 
 # ============================================================
+# Args parsing (no argparse to keep it minimal/stable)
+# - default: mode="full" and filePath is last positional
+# - accept: fingerprint.py --mode hum <filePath>
+# - accept: fingerprint.py <filePath> --mode hum
+# ============================================================
+def parse_args(argv):
+    mode = "full"
+    file_path = None
+
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--mode", "-m"):
+            if i + 1 >= len(argv):
+                return None, None, "missing value after --mode"
+            mode = str(argv[i + 1]).strip().lower()
+            i += 2
+            continue
+        if a.startswith("--mode="):
+            mode = a.split("=", 1)[1].strip().lower()
+            i += 1
+            continue
+
+        # positional
+        if not a.startswith("-"):
+            file_path = a
+        i += 1
+
+    if not file_path:
+        return None, None, "missing filePath"
+    if mode not in ("full", "hum"):
+        return None, None, f"unsupported mode: {mode}"
+
+    return file_path, mode, None
+
+# ============================================================
 # 0) Convert input audio to WAV + CUT early (ffmpeg -t)
 # ============================================================
-def convert_to_wav(input_path: str, target_sr: int = TARGET_SR, max_seconds: float = MAX_SECONDS_MAIN) -> Optional[str]:
+def convert_to_wav(input_path: str, target_sr: int, max_seconds: float) -> Optional[str]:
     """
     Returns path to a temporary wav file, or None if conversion fails.
     Needs ffmpeg. Cuts early with -t max_seconds to avoid heavy load.
@@ -119,7 +160,6 @@ def trim_audio(y, sr: int, max_seconds: float):
 
 # ============================================================
 # 1) MATCH SIGNATURE (polyphonique) : chroma SEQUENCE compressée
-#    Optimisé: accepte chroma déjà calculé pour éviter double compute.
 # ============================================================
 def build_chroma_match_signature_from_chroma(chroma_12T, sr, *, hop_length=HOP_LENGTH, frames_per_sec=4, max_seconds=MAX_SECONDS_MATCH):
     import numpy as np
@@ -132,7 +172,7 @@ def build_chroma_match_signature_from_chroma(chroma_12T, sr, *, hop_length=HOP_L
     eps = 1e-9
     chroma = chroma_12T.astype(np.float32)
 
-    # chroma_12T = (12, T). Normalize over pitch classes per frame (sum over 12).
+    # Normalize per frame
     chroma = chroma / (np.sum(chroma, axis=0, keepdims=True) + eps)
 
     # downsample frames to target fps
@@ -241,114 +281,195 @@ def build_melody_signature(y, sr, *, hop_length=HOP_LENGTH, n_points=120, max_se
     return sig.tolist(), melody_meta
 
 # ============================================================
+# FULL MODE (inchangé + outputs existants)
+# - garde fingerprint global + match + melody
+# ============================================================
+def process_full(input_path: str, wav_tmp: Optional[str], *, t0: float):
+    import numpy as np
+    import librosa
+
+    load_path = wav_tmp or input_path
+
+    log("[fingerprint.py] Loading audio...")
+    y, sr = librosa.load(load_path, sr=TARGET_SR, mono=True)
+
+    # TRIM HARD
+    y = trim_audio(y, sr, MAX_SECONDS_MAIN)
+
+    duration = float(librosa.get_duration(y=y, sr=sr))
+    log(f"[fingerprint.py] Loaded+trim. sr={sr}, samples={len(y)}, duration={duration:.2f}s")
+
+    # normalize
+    eps = 1e-9
+    y = y.astype(np.float32)
+    y = y / (np.max(np.abs(y)) + eps)
+
+    # compute chroma ONCE
+    log("[fingerprint.py] Computing chroma...")
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=HOP_LENGTH)
+
+    log("[fingerprint.py] Computing MFCC...")
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20, hop_length=HOP_LENGTH)
+
+    log("[fingerprint.py] Computing onset strength...")
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=HOP_LENGTH)
+
+    log("[fingerprint.py] Estimating tempo...")
+    tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
+    tempo = float(_safe_float(tempo, 0.0))
+
+    # stats
+    chroma_mean = np.mean(chroma, axis=1)
+    chroma_std = np.std(chroma, axis=1)
+
+    mfcc_mean = np.mean(mfcc, axis=1)
+    mfcc_std = np.std(mfcc, axis=1)
+
+    onset_mean = float(np.mean(onset_env)) if getattr(onset_env, "size", 0) else 0.0
+    onset_std  = float(np.std(onset_env)) if getattr(onset_env, "size", 0) else 0.0
+
+    vec = np.concatenate([
+        chroma_mean, chroma_std,
+        mfcc_mean, mfcc_std,
+        np.array([onset_mean, onset_std], dtype=np.float32)
+    ]).astype(np.float32)
+
+    q = np.round(vec * 1000.0).astype(np.int16)
+    fingerprint = sha256_hex(q.tobytes())
+    short_fp = fingerprint[:16]
+
+    # match signature (no recompute)
+    match_sig, match_shape, match_meta = build_chroma_match_signature_from_chroma(
+        chroma, sr, hop_length=HOP_LENGTH, frames_per_sec=4, max_seconds=MAX_SECONDS_MATCH
+    )
+
+    # melody signature
+    melody_sig, melody_meta = build_melody_signature(
+        y, sr, hop_length=HOP_LENGTH, n_points=120, max_seconds=MAX_SECONDS_MELODY
+    )
+
+    elapsed = time.time() - t0
+    log(f"[fingerprint.py] Done(full) in {elapsed:.2f}s. fingerprint={short_fp}...")
+
+    out = {
+        "ok": True,
+        "mode": "full",
+        "fingerprint": fingerprint,
+        "fingerprint_short": short_fp,
+        "meta": {
+            "sr": int(sr),
+            "duration_sec": float(duration),
+            "tempo_bpm_est": float(tempo),
+            "vector_dim": int(q.shape[0]),
+            "quant_scale": 1000.0,
+            "used_ffmpeg_wav": bool(wav_tmp),
+            "max_seconds_main": float(MAX_SECONDS_MAIN),
+        },
+        "match": {
+            "shape": match_shape,
+            "signature": match_sig,
+            **match_meta
+        },
+        "melody": {
+            "signature": melody_sig,
+            **melody_meta
+        }
+    }
+    return out
+
+# ============================================================
+# HUM MODE (nouveau) : rapide pour Recorder 7s
+# - garde "match" (polyphonique) + "melody"
+# - retourne aussi des hashes utiles pour Wix DB
+# - ne casse pas le mode full existant
+# ============================================================
+def process_hum(input_path: str, wav_tmp: Optional[str], *, t0: float):
+    import numpy as np
+    import librosa
+
+    load_path = wav_tmp or input_path
+
+    log("[fingerprint.py] Loading audio (hum)...")
+    y, sr = librosa.load(load_path, sr=TARGET_SR, mono=True)
+    y = trim_audio(y, sr, MAX_SECONDS_HUM)
+
+    duration = float(librosa.get_duration(y=y, sr=sr))
+    log(f"[fingerprint.py] Loaded+trim(hum). sr={sr}, samples={len(y)}, duration={duration:.2f}s")
+
+    eps = 1e-9
+    y = y.astype(np.float32)
+    y = y / (np.max(np.abs(y)) + eps)
+
+    # ✅ chroma (polyphonique) -> match signature
+    log("[fingerprint.py] Computing chroma (hum)...")
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=HOP_LENGTH)
+
+    match_sig, match_shape, match_meta = build_chroma_match_signature_from_chroma(
+        chroma, sr, hop_length=HOP_LENGTH, frames_per_sec=4, max_seconds=MAX_SECONDS_HUM
+    )
+    match_hash = match_meta.get("hash") if isinstance(match_meta, dict) else None
+
+    # ✅ melody signature (monophonique) -> utile si tu veux matcher aussi le fredonnement
+    melody_sig, melody_meta = build_melody_signature(
+        y, sr, hop_length=HOP_LENGTH, n_points=120, max_seconds=min(MAX_SECONDS_MELODY, MAX_SECONDS_HUM)
+    )
+    melody_hash = melody_meta.get("melody_hash") if isinstance(melody_meta, dict) else None
+
+    # ✅ hash combiné (simple, pratique côté Wix)
+    combo_src = f"{match_hash or ''}|{melody_hash or ''}".encode("utf-8", errors="ignore")
+    hum_hash = sha256_hex(combo_src) if (match_hash or melody_hash) else None
+
+    elapsed = time.time() - t0
+    log(f"[fingerprint.py] Done(hum) in {elapsed:.2f}s. hum_hash={(hum_hash or '')[:16]}...")
+
+    out = {
+        "ok": True,
+        "mode": "hum",
+        "hum_hash": hum_hash,
+        "meta": {
+            "sr": int(sr),
+            "duration_sec": float(duration),
+            "used_ffmpeg_wav": bool(wav_tmp),
+            "max_seconds_hum": float(MAX_SECONDS_HUM),
+        },
+        "match": {
+            "shape": match_shape,
+            "signature": match_sig,
+            **match_meta
+        },
+        "melody": {
+            "signature": melody_sig,
+            **melody_meta
+        }
+    }
+    return out
+
+# ============================================================
 # MAIN
 # ============================================================
 def main():
-    if len(sys.argv) < 2:
-        return fail("missing filePath", code=2)
+    file_path, mode, err = parse_args(sys.argv)
+    if err:
+        return fail(err, code=2)
 
-    input_path = sys.argv[1]
+    input_path = file_path
     t0 = time.time()
-    log(f"[fingerprint.py] Start. file={input_path}")
+    log(f"[fingerprint.py] Start. mode={mode} file={input_path}")
 
     wav_tmp = None
     try:
-        import numpy as np
-        import librosa
-
-        # ✅ conversion + CUT via ffmpeg -t
-        wav_tmp = convert_to_wav(input_path, target_sr=TARGET_SR, max_seconds=MAX_SECONDS_MAIN)
-        load_path = wav_tmp or input_path
-
+        # ✅ conversion + CUT via ffmpeg -t (diff selon mode)
+        cut_seconds = MAX_SECONDS_MAIN if mode == "full" else MAX_SECONDS_HUM
+        wav_tmp = convert_to_wav(input_path, target_sr=TARGET_SR, max_seconds=cut_seconds)
         if wav_tmp:
             log(f"[fingerprint.py] Using converted wav: {wav_tmp}")
         else:
             log("[fingerprint.py] Using original file (no conversion).")
 
-        log("[fingerprint.py] Loading audio...")
-        y, sr = librosa.load(load_path, sr=TARGET_SR, mono=True)
-
-        # ✅ TRIM HARD (au cas où pas de conversion)
-        y = trim_audio(y, sr, MAX_SECONDS_MAIN)
-
-        duration = float(librosa.get_duration(y=y, sr=sr))
-        log(f"[fingerprint.py] Loaded+trim. sr={sr}, samples={len(y)}, duration={duration:.2f}s")
-
-        # normalize
-        eps = 1e-9
-        y = y.astype(np.float32)
-        y = y / (np.max(np.abs(y)) + eps)
-
-        # ✅ compute chroma ONCE
-        log("[fingerprint.py] Computing chroma...")
-        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=HOP_LENGTH)
-
-        log("[fingerprint.py] Computing MFCC...")
-        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20, hop_length=HOP_LENGTH)
-
-        log("[fingerprint.py] Computing onset strength...")
-        onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=HOP_LENGTH)
-
-        log("[fingerprint.py] Estimating tempo...")
-        tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
-        tempo = float(_safe_float(tempo, 0.0))
-
-        # stats
-        chroma_mean = np.mean(chroma, axis=1)
-        chroma_std = np.std(chroma, axis=1)
-
-        mfcc_mean = np.mean(mfcc, axis=1)
-        mfcc_std = np.std(mfcc, axis=1)
-
-        onset_mean = float(np.mean(onset_env)) if getattr(onset_env, "size", 0) else 0.0
-        onset_std  = float(np.std(onset_env)) if getattr(onset_env, "size", 0) else 0.0
-
-        vec = np.concatenate([
-            chroma_mean, chroma_std,
-            mfcc_mean, mfcc_std,
-            np.array([onset_mean, onset_std], dtype=np.float32)
-        ]).astype(np.float32)
-
-        q = np.round(vec * 1000.0).astype(np.int16)
-        fingerprint = sha256_hex(q.tobytes())
-        short_fp = fingerprint[:16]
-
-        # ✅ match signature depuis chroma déjà calculé (pas de recompute)
-        match_sig, match_shape, match_meta = build_chroma_match_signature_from_chroma(
-            chroma, sr, hop_length=HOP_LENGTH, frames_per_sec=4, max_seconds=MAX_SECONDS_MATCH
-        )
-
-        # melody signature (pyin) - limité à MAX_SECONDS_MELODY
-        melody_sig, melody_meta = build_melody_signature(
-            y, sr, hop_length=HOP_LENGTH, n_points=120, max_seconds=MAX_SECONDS_MELODY
-        )
-
-        elapsed = time.time() - t0
-        log(f"[fingerprint.py] Done in {elapsed:.2f}s. fingerprint={short_fp}...")
-
-        out = {
-            "ok": True,
-            "fingerprint": fingerprint,
-            "fingerprint_short": short_fp,
-            "meta": {
-                "sr": int(sr),
-                "duration_sec": float(duration),
-                "tempo_bpm_est": float(tempo),
-                "vector_dim": int(q.shape[0]),
-                "quant_scale": 1000.0,
-                "used_ffmpeg_wav": bool(wav_tmp),
-                "max_seconds_main": float(MAX_SECONDS_MAIN),
-            },
-            "match": {
-                "shape": match_shape,
-                "signature": match_sig,
-                **match_meta
-            },
-            "melody": {
-                "signature": melody_sig,
-                **melody_meta
-            }
-        }
+        if mode == "full":
+            out = process_full(input_path, wav_tmp, t0=t0)
+        else:
+            out = process_hum(input_path, wav_tmp, t0=t0)
 
         return ok(out, code=0)
 
@@ -358,7 +479,7 @@ def main():
         return fail(
             "python_exception",
             code=1,
-            extra={"type": str(type(e)), "msg": str(e)}
+            extra={"type": str(type(e)), "msg": str(e), "mode": mode}
         )
 
     finally:
