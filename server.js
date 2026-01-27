@@ -339,32 +339,32 @@ app.get("/ping", (_req, res) => res.json({ status: "ok", message: "Backend awake
 // ============================================================
 // VOIE A) Fingerprint - URL helpers
 // ============================================================
-function fpUrls(jobId) {
+function fpUrls(req, jobId) {
   return {
-    pollUrl: `/fingerprint/${jobId}`,
-    resultUrl: `/fingerprint/result/${jobId}`,
-    logsUrl: `/fingerprint/logs/${jobId}`,
+    pollUrl: absUrl(req, `/fingerprint/${jobId}`),
+    resultUrl: absUrl(req, `/fingerprint/result/${jobId}`),
+    logsUrl: absUrl(req, `/fingerprint/logs/${jobId}`),
   };
 }
 
 // ============================================================
 // VOIE B) QBH - URL helpers
 // ============================================================
-function qbhUrls(jobId) {
+function qbhUrls(req, jobId) {
   return {
-    pollUrl: `/qbh/${jobId}`,
-    resultUrl: `/qbh/result/${jobId}`,
-    logsUrl: `/qbh/logs/${jobId}`,
+    pollUrl: absUrl(req, `/qbh/${jobId}`),
+    resultUrl: absUrl(req, `/qbh/result/${jobId}`),
+    logsUrl: absUrl(req, `/qbh/logs/${jobId}`),
   };
 }
 
 // ============================================================
 // VOIE C) AUdD - URL helpers
 // ============================================================
-function auddUrls(baseJobId) {
+function auddUrls(req, baseJobId) {
   return {
-    pollUrl: `/melody/result/${baseJobId}?backend=audd`,
-    resultUrl: `/melody/result/${baseJobId}?backend=audd`,
+    pollUrl: absUrl(req, `/melody/result/${baseJobId}?backend=audd`),
+    resultUrl: absUrl(req, `/melody/result/${baseJobId}?backend=audd`),
   };
 }
 
@@ -375,27 +375,23 @@ function auddUrls(baseJobId) {
 // qbhJobId  = baseJobId + "-qbh"
 // auddJobId = baseJobId
 // ============================================================
-function bundleUrls(baseJobId) {
+function bundleUrls(req, baseJobId) {
   const fpJobId = `${baseJobId}-fp`;
   const qbhJobId = `${baseJobId}-qbh`;
 
   return {
-    bundleUrl: `/bundle/${baseJobId}`,
-    audd: auddUrls(baseJobId),
-    fp: fpUrls(fpJobId),
-    qbh: qbhUrls(qbhJobId),
+    bundleUrl: absUrl(req, `/bundle/${baseJobId}`),
+    audd: auddUrls(req, baseJobId),
+    fp: fpUrls(req, fpJobId),
+    qbh: qbhUrls(req, qbhJobId),
   };
 }
 
 // ✅ LOG RENDER: 1 ligne propre pour voir l'URL bundle (+ les 3 sous urls)
-function logBundle(baseJobId, origin) {
-  const u = bundleUrls(baseJobId);
+function logBundle(req, baseJobId) {
+  const u = bundleUrls(req, baseJobId);
   console.log(
-    `🔗 BUNDLE base=${baseJobId} origin=${origin || "none"} ` +
-      `bundle=${u.bundleUrl} | ` +
-      `audd=${u.audd.resultUrl} | ` +
-      `fp=${u.fp.resultUrl} | ` +
-      `qbh=${u.qbh.resultUrl}`
+    `🔗 BUNDLE base=${baseJobId} bundle=${u.bundleUrl} | audd=${u.audd.resultUrl} | fp=${u.fp.resultUrl} | qbh=${u.qbh.resultUrl}`
   );
 }
 
