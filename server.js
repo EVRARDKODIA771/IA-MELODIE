@@ -86,7 +86,7 @@ const API_TOKEN = "3523e792bbced184caa4f51a33a2494a";
 // =========================
 // SAFE PY ENV (STABLE NUMBA + ANTI THREAD CRASH)
 // =========================
-// ⚠️ IMPORTANT: on force cet env sur TOUS les spawn python, y compris melody/upload
+// ⚠️ IMPORTANT: on force cet env sur TOUS les spawn python
 const NUMBA_CACHE_DIR = "/tmp/numba_cache";
 try {
   fs.mkdirSync(NUMBA_CACHE_DIR, { recursive: true });
@@ -94,9 +94,6 @@ try {
 
 const SAFE_PY_ENV = {
   ...process.env,
-
-  // ❌ NE PAS mettre NUMBA_DISABLE_JIT=1 (ça peut casser QBH avec des fonctions numba)
-  // NUMBA_DISABLE_JIT: "1",
 
   // ✅ Numba: garder JIT mais contrôler ressources
   NUMBA_NUM_THREADS: "1",
@@ -336,13 +333,15 @@ app.get("/debug/echo", (req, res) => {
 app.get("/ping", (_req, res) => res.json({ status: "ok", message: "Backend awake" }));
 
 // ============================================================
-// VOIE C) Melody (AUdD) (inchangé logique, mais job typé "audd")
+// VOIE C) Melody (AUdD) (job typé "audd")
 // ============================================================
 app.post("/melody/upload", upload.single("file"), async (req, res) => {
   console.log("✅ HIT /melody/upload", "origin=", req.headers.origin, "jobId=", req.body?.jobId);
 
   const { jobId } = req.body;
-  const backend = req.query.backend || "python";
+
+  // ✅ FIX: par défaut c'est audd, pas python
+  const backend = req.query.backend || "audd";
 
   if (!req.file) return res.status(400).json({ status: "error", message: "No file" });
   if (!jobId) return res.status(400).json({ status: "error", message: "JobID manquant" });
@@ -371,8 +370,9 @@ app.post("/melody/upload", upload.single("file"), async (req, res) => {
       return res.json({
         status: "ok",
         jobId,
-        pollUrl: `/melody/result/${jobId}`,
-        resultUrl: `/melody/result/${jobId}`,
+        // ✅ FIX: cohérence backend dans les URLs
+        pollUrl: `/melody/result/${jobId}?backend=audd`,
+        resultUrl: `/melody/result/${jobId}?backend=audd`,
         message: "AUdD OK",
       });
     } catch (err) {
@@ -381,12 +381,12 @@ app.post("/melody/upload", upload.single("file"), async (req, res) => {
       const job = ensureJob(type, jobId);
       job.status = "error";
       job.error = "AUdD API error";
+      job.result = null;
       saveJob(type, jobId);
       return res.status(500).json({ status: "error", message: "AUdD API error" });
     }
   }
 
-  // (On évite l'ancien mode python ici pour ne pas confondre les voies)
   fs.unlink(filePath, () => {});
   return res.status(400).json({ status: "error", message: "backend=python disabled here (use /fingerprint/*)" });
 });
@@ -397,9 +397,30 @@ app.get("/melody/result/:jobId", (req, res) => {
 
   const type = "audd";
   const job = resultsByJobKey[jobKey(type, jobId)] || loadJob(type, jobId);
-  if (!job || !job.result) return res.status(404).json({ status: "error", message: "Résultat non trouvé" });
+  if (!job) return res.status(404).json({ status: "error", message: "JobID inconnu" });
 
   resultsByJobKey[jobKey(type, jobId)] = job;
+
+  // ✅ FIX: si pas encore prêt → 202 (pour polling)
+  if (job.status === "processing" || job.status === "pending") {
+    return res.status(202).json({
+      status: job.status,
+      jobId,
+      pollUrl: `/melody/result/${jobId}?backend=audd`,
+      resultUrl: `/melody/result/${jobId}?backend=audd`,
+      message: "Pas prêt",
+    });
+  }
+
+  if (job.status === "error") {
+    return res.status(500).json({
+      status: "error",
+      jobId,
+      message: job.error || "Erreur AUdD",
+    });
+  }
+
+  // done
   return res.json(job.result);
 });
 
@@ -522,7 +543,7 @@ app.post("/fingerprint/upload", upload.single("file"), async (req, res) => {
   })();
 });
 
-// ✅ ROUTE MANQUANTE pour Recorder.jsx (chant/hum)
+// ✅ ROUTE pour Recorder.jsx (chant/hum)
 app.post("/fingerprint/hum/upload", upload.single("file"), async (req, res) => {
   console.log("✅ HIT /fingerprint/hum/upload", "origin=", req.headers.origin, "jobId=", req.body?.jobId);
 
@@ -898,7 +919,7 @@ app.post("/qbh/query/extract/upload", upload.single("file"), async (req, res) =>
   (async () => {
     try {
       const payload = {
-        mode: "extract_query", // 👈 à implémenter dans qbh_engine.py
+        mode: "extract_query",
         audio_path: filePath,
         sr: 22050,
         max_seconds: 12,
