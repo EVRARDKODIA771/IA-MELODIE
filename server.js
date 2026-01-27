@@ -1076,12 +1076,6 @@ app.get("/bundle/:baseJobId", (req, res) => {
   const fpJob = resultsByJobKey[jobKey("fp", fpJobId)] || loadJob("fp", fpJobId);
   const qbhJob = resultsByJobKey[jobKey("qbh", qbhJobId)] || loadJob("qbh", qbhJobId);
 
-  if (auddJob) resultsByJobKey[jobKey("audd", baseJobId)] = auddJob;
-  if (fpJob) resultsByJobKey[jobKey("fp", fpJobId)] = fpJob;
-  if (qbhJob) resultsByJobKey[jobKey("qbh", qbhJobId)] = qbhJob;
-
-  const urls = bundleUrls(baseJobId);
-
   const parts = {
     audd: auddJob ? auddJob.status : "missing",
     fingerprint: fpJob ? fpJob.status : "missing",
@@ -1094,7 +1088,7 @@ app.get("/bundle/:baseJobId", (req, res) => {
   const payload = {
     status: allDone ? "done" : anyError ? "error" : "processing",
     baseJobId,
-    urls,
+    urls: bundleUrls(req, baseJobId), // ✅ ABSOLUTES
     parts,
     results: {
       audd: auddJob?.status === "done" ? auddJob.result : null,
@@ -1112,6 +1106,7 @@ app.get("/bundle/:baseJobId", (req, res) => {
   if (payload.status === "error") return res.status(500).json(payload);
   return res.status(202).json(payload);
 });
+
 
 // =========================
 // Lancement serveur
