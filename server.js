@@ -6,6 +6,10 @@
 // 2) /qbh/query/extract/upload -> pour extraire la requête QBH sans candidates (comparaison faite par Wix)
 // 3) Séparation des jobs par type (fp / qbh / audd) pour éviter collisions
 // 4) Retours uniformes: pollUrl/resultUrl/logsUrl
+//
+// ✅ AJOUTS (bundle):
+// - /bundle/:baseJobId -> 1 seule URL qui regroupe les 3 réponses (audd + fp + qbh)
+// - logs Render: affiche 1 ligne "🔗 BUNDLE ..." contenant bundleUrl + (optionnel) les 3 urls
 
 import express from "express";
 import multer from "multer";
@@ -333,12 +337,78 @@ app.get("/debug/echo", (req, res) => {
 app.get("/ping", (_req, res) => res.json({ status: "ok", message: "Backend awake" }));
 
 // ============================================================
+// VOIE A) Fingerprint - URL helpers
+// ============================================================
+function fpUrls(jobId) {
+  return {
+    pollUrl: `/fingerprint/${jobId}`,
+    resultUrl: `/fingerprint/result/${jobId}`,
+    logsUrl: `/fingerprint/logs/${jobId}`,
+  };
+}
+
+// ============================================================
+// VOIE B) QBH - URL helpers
+// ============================================================
+function qbhUrls(jobId) {
+  return {
+    pollUrl: `/qbh/${jobId}`,
+    resultUrl: `/qbh/result/${jobId}`,
+    logsUrl: `/qbh/logs/${jobId}`,
+  };
+}
+
+// ============================================================
+// VOIE C) AUdD - URL helpers
+// ============================================================
+function auddUrls(baseJobId) {
+  return {
+    pollUrl: `/melody/result/${baseJobId}?backend=audd`,
+    resultUrl: `/melody/result/${baseJobId}?backend=audd`,
+  };
+}
+
+// ============================================================
+// BUNDLE (regroupe AUdD + Fingerprint + QBH)
+// baseJobId = job-xxxxx-w6cpsb
+// fpJobId   = baseJobId + "-fp"
+// qbhJobId  = baseJobId + "-qbh"
+// auddJobId = baseJobId
+// ============================================================
+function bundleUrls(baseJobId) {
+  const fpJobId = `${baseJobId}-fp`;
+  const qbhJobId = `${baseJobId}-qbh`;
+
+  return {
+    bundleUrl: `/bundle/${baseJobId}`,
+    audd: auddUrls(baseJobId),
+    fp: fpUrls(fpJobId),
+    qbh: qbhUrls(qbhJobId),
+  };
+}
+
+// ✅ LOG RENDER: 1 ligne propre pour voir l'URL bundle (+ les 3 sous urls)
+function logBundle(baseJobId, origin) {
+  const u = bundleUrls(baseJobId);
+  console.log(
+    `🔗 BUNDLE base=${baseJobId} origin=${origin || "none"} ` +
+      `bundle=${u.bundleUrl} | ` +
+      `audd=${u.audd.resultUrl} | ` +
+      `fp=${u.fp.resultUrl} | ` +
+      `qbh=${u.qbh.resultUrl}`
+  );
+}
+
+// ============================================================
 // VOIE C) Melody (AUdD) (job typé "audd")
 // ============================================================
 app.post("/melody/upload", upload.single("file"), async (req, res) => {
   console.log("✅ HIT /melody/upload", "origin=", req.headers.origin, "jobId=", req.body?.jobId);
 
   const { jobId } = req.body;
+
+  // ✅ IMPORTANT: log immédiat des urls (bundle + sous urls)
+  if (jobId) logBundle(jobId, req.headers.origin);
 
   // ✅ FIX: par défaut c'est audd, pas python
   const backend = req.query.backend || "audd";
@@ -428,14 +498,6 @@ app.get("/melody/result/:jobId", (req, res) => {
 // VOIE A) Fingerprint
 // ============================================================
 
-function fpUrls(jobId) {
-  return {
-    pollUrl: `/fingerprint/${jobId}`,
-    resultUrl: `/fingerprint/result/${jobId}`,
-    logsUrl: `/fingerprint/logs/${jobId}`,
-  };
-}
-
 app.post("/fingerprint/url", async (req, res) => {
   const { url, jobId } = req.body;
   if (!url || !jobId) return res.status(400).json({ status: "error", message: "URL or JobID missing" });
@@ -497,6 +559,10 @@ app.post("/fingerprint/upload", upload.single("file"), async (req, res) => {
   console.log("✅ HIT /fingerprint/upload", "origin=", req.headers.origin, "jobId=", req.body?.jobId);
 
   const { jobId } = req.body;
+
+  // ✅ optionnel: si tu utilises aussi baseJobId ici, tu peux logBundle(jobIdSansSuffixe)
+  // if (jobId) logBundle(jobId, req.headers.origin);
+
   if (!req.file) return res.status(400).json({ status: "error", message: "No file" });
   if (!jobId) return res.status(400).json({ status: "error", message: "JobID missing" });
 
@@ -548,6 +614,13 @@ app.post("/fingerprint/hum/upload", upload.single("file"), async (req, res) => {
   console.log("✅ HIT /fingerprint/hum/upload", "origin=", req.headers.origin, "jobId=", req.body?.jobId);
 
   const { jobId } = req.body;
+
+  // ✅ IMPORTANT: ici jobId finit par -fp, on log le baseJobId
+  if (jobId) {
+    const baseJobId = jobId.replace(/-fp$/, "");
+    logBundle(baseJobId, req.headers.origin);
+  }
+
   if (!req.file) return res.status(400).json({ status: "error", message: "No file" });
   if (!jobId) return res.status(400).json({ status: "error", message: "JobID missing" });
 
@@ -654,14 +727,6 @@ function parseCandidates(raw) {
     }
   }
   return [];
-}
-
-function qbhUrls(jobId) {
-  return {
-    pollUrl: `/qbh/${jobId}`,
-    resultUrl: `/qbh/result/${jobId}`,
-    logsUrl: `/qbh/logs/${jobId}`,
-  };
 }
 
 // ----------- QBH INDEX (upload) -----------
@@ -894,6 +959,13 @@ app.post("/qbh/query/extract/upload", upload.single("file"), async (req, res) =>
   console.log("✅ HIT /qbh/query/extract/upload", "origin=", req.headers.origin, "jobId=", req.body?.jobId);
 
   const { jobId } = req.body;
+
+  // ✅ IMPORTANT: ici jobId finit par -qbh, on log le baseJobId
+  if (jobId) {
+    const baseJobId = jobId.replace(/-qbh$/, "");
+    logBundle(baseJobId, req.headers.origin);
+  }
+
   if (!req.file) return res.status(400).json({ status: "error", message: "No file" });
   if (!jobId) return res.status(400).json({ status: "error", message: "JobID missing" });
 
@@ -988,6 +1060,61 @@ app.get("/qbh/logs/:jobId", (req, res) => {
   if (!job) return res.status(404).json({ status: "error", message: "JobID inconnu" });
   resultsByJobKey[jobKey(type, jobId)] = job;
   return res.json({ status: "ok", jobId, logs: job.logs || [] });
+});
+
+// ============================================================
+// ✅ BUNDLE ROUTE: 1 seule URL qui regroupe les 3 réponses
+// GET /bundle/:baseJobId
+// - audd jobId = baseJobId
+// - fp  jobId = baseJobId + "-fp"
+// - qbh jobId = baseJobId + "-qbh"
+// ============================================================
+app.get("/bundle/:baseJobId", (req, res) => {
+  const { baseJobId } = req.params;
+  if (!baseJobId) return res.status(400).json({ status: "error", message: "baseJobId missing" });
+
+  const fpJobId = `${baseJobId}-fp`;
+  const qbhJobId = `${baseJobId}-qbh`;
+
+  const auddJob = resultsByJobKey[jobKey("audd", baseJobId)] || loadJob("audd", baseJobId);
+  const fpJob = resultsByJobKey[jobKey("fp", fpJobId)] || loadJob("fp", fpJobId);
+  const qbhJob = resultsByJobKey[jobKey("qbh", qbhJobId)] || loadJob("qbh", qbhJobId);
+
+  if (auddJob) resultsByJobKey[jobKey("audd", baseJobId)] = auddJob;
+  if (fpJob) resultsByJobKey[jobKey("fp", fpJobId)] = fpJob;
+  if (qbhJob) resultsByJobKey[jobKey("qbh", qbhJobId)] = qbhJob;
+
+  const urls = bundleUrls(baseJobId);
+
+  const parts = {
+    audd: auddJob ? auddJob.status : "missing",
+    fingerprint: fpJob ? fpJob.status : "missing",
+    qbh: qbhJob ? qbhJob.status : "missing",
+  };
+
+  const allDone = parts.audd === "done" && parts.fingerprint === "done" && parts.qbh === "done";
+  const anyError = parts.audd === "error" || parts.fingerprint === "error" || parts.qbh === "error";
+
+  const payload = {
+    status: allDone ? "done" : anyError ? "error" : "processing",
+    baseJobId,
+    urls,
+    parts,
+    results: {
+      audd: auddJob?.status === "done" ? auddJob.result : null,
+      fingerprint: fpJob?.status === "done" ? fpJob.result : null,
+      qbh: qbhJob?.status === "done" ? qbhJob.result : null,
+    },
+    errors: {
+      audd: auddJob?.status === "error" ? auddJob.error : null,
+      fingerprint: fpJob?.status === "error" ? fpJob.error : null,
+      qbh: qbhJob?.status === "error" ? qbhJob.error : null,
+    },
+  };
+
+  if (payload.status === "done") return res.json(payload);
+  if (payload.status === "error") return res.status(500).json(payload);
+  return res.status(202).json(payload);
 });
 
 // =========================
