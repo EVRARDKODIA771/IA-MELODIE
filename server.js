@@ -1,16 +1,3 @@
-// server.js (UPDATED: stable numba + anti-thread-crash + env forcé sur CHAQUE spawn python)
-// ✅ Remplace ton server.js par celui-ci
-//
-// ✅ Ajouts indispensables (carrefour 3 voies):
-// 1) /fingerprint/hum/upload   -> pour Recorder.jsx (chant / hum)
-// 2) /qbh/query/extract/upload -> pour extraire la requête QBH sans candidates (comparaison faite par Wix)
-// 3) Séparation des jobs par type (fp / qbh / audd) pour éviter collisions
-// 4) Retours uniformes: pollUrl/resultUrl/logsUrl
-//
-// ✅ AJOUTS (bundle):
-// - /bundle/:baseJobId -> 1 seule URL qui regroupe les 3 réponses (audd + fp + qbh)
-// - logs Render: affiche 1 ligne "🔗 BUNDLE ..." contenant bundleUrl + (optionnel) les 3 urls
-
 import express from "express";
 import multer from "multer";
 import fs from "fs";
@@ -193,6 +180,25 @@ setInterval(() => {
 // =========================
 // Utils
 // =========================
+
+// ✅ FIX: absUrl manquant (cause du ReferenceError)
+function absUrl(req, maybeUrl) {
+  if (!maybeUrl) return null;
+
+  // déjà absolue
+  if (/^https?:\/\//i.test(maybeUrl)) return maybeUrl;
+
+  // derrière proxy (Render)
+  const proto = (req.headers["x-forwarded-proto"] || req.protocol || "https").toString();
+  const host = (req.headers["x-forwarded-host"] || req.get("host")).toString();
+
+  // possibilité de forcer une base publique
+  const base = process.env.PUBLIC_BASE_URL || `${proto}://${host}`;
+
+  const p = maybeUrl.startsWith("/") ? maybeUrl : `/${maybeUrl}`;
+  return new URL(p, base).toString();
+}
+
 async function downloadToFile(url, destPath, type, jobId) {
   pushLog(type, jobId, `Téléchargement du fichier depuis ${url}`);
   const res = await fetch(url);
@@ -403,8 +409,8 @@ app.post("/melody/upload", upload.single("file"), async (req, res) => {
 
   const { jobId } = req.body;
 
-  // ✅ IMPORTANT: log immédiat des urls (bundle + sous urls)
-  if (jobId) logBundle(jobId, req.headers.origin);
+  // ✅ FIX: ordre des arguments (req, baseJobId)
+  if (jobId) logBundle(req, jobId);
 
   // ✅ FIX: par défaut c'est audd, pas python
   const backend = req.query.backend || "audd";
@@ -433,12 +439,11 @@ app.post("/melody/upload", upload.single("file"), async (req, res) => {
       saveJob(type, jobId);
 
       fs.unlink(filePath, () => {});
+      const urls = auddUrls(req, jobId); // ✅ ABSOLUTES
       return res.json({
         status: "ok",
         jobId,
-        // ✅ FIX: cohérence backend dans les URLs
-        pollUrl: `/melody/result/${jobId}?backend=audd`,
-        resultUrl: `/melody/result/${jobId}?backend=audd`,
+        ...urls,
         message: "AUdD OK",
       });
     } catch (err) {
@@ -469,11 +474,11 @@ app.get("/melody/result/:jobId", (req, res) => {
 
   // ✅ FIX: si pas encore prêt → 202 (pour polling)
   if (job.status === "processing" || job.status === "pending") {
+    const urls = auddUrls(req, jobId);
     return res.status(202).json({
       status: job.status,
       jobId,
-      pollUrl: `/melody/result/${jobId}?backend=audd`,
-      resultUrl: `/melody/result/${jobId}?backend=audd`,
+      ...urls,
       message: "Pas prêt",
     });
   }
@@ -502,7 +507,7 @@ app.post("/fingerprint/url", async (req, res) => {
   const job = ensureJob(type, jobId);
 
   if (job.status === "done" || job.status === "processing") {
-    const urls = fpUrls(jobId);
+    const urls = fpUrls(req, jobId); // ✅ FIX: pass req
     return res.json({
       status: "ok",
       jobId,
@@ -519,7 +524,7 @@ app.post("/fingerprint/url", async (req, res) => {
   pushLog(type, jobId, "Job fingerprint démarré (URL).");
   const tmpFile = `/tmp/${jobId}.audio`;
 
-  const urls = fpUrls(jobId);
+  const urls = fpUrls(req, jobId); // ✅ FIX: pass req
   res.json({
     status: "ok",
     jobId,
@@ -556,9 +561,6 @@ app.post("/fingerprint/upload", upload.single("file"), async (req, res) => {
 
   const { jobId } = req.body;
 
-  // ✅ optionnel: si tu utilises aussi baseJobId ici, tu peux logBundle(jobIdSansSuffixe)
-  // if (jobId) logBundle(jobId, req.headers.origin);
-
   if (!req.file) return res.status(400).json({ status: "error", message: "No file" });
   if (!jobId) return res.status(400).json({ status: "error", message: "JobID missing" });
 
@@ -567,7 +569,7 @@ app.post("/fingerprint/upload", upload.single("file"), async (req, res) => {
 
   if (job.status === "done") {
     fs.unlink(req.file.path, () => {});
-    const urls = fpUrls(jobId);
+    const urls = fpUrls(req, jobId); // ✅ FIX: pass req
     return res.json({ status: "ok", jobId, message: "Déjà calculé", ...urls });
   }
 
@@ -577,7 +579,7 @@ app.post("/fingerprint/upload", upload.single("file"), async (req, res) => {
   saveJob(type, jobId);
   pushLog(type, jobId, "Job fingerprint démarré (UPLOAD).");
 
-  const urls = fpUrls(jobId);
+  const urls = fpUrls(req, jobId); // ✅ FIX: pass req
   res.json({ status: "ok", jobId, message: "Upload accepté, traitement en cours", ...urls });
 
   const filePath = req.file.path;
@@ -611,10 +613,10 @@ app.post("/fingerprint/hum/upload", upload.single("file"), async (req, res) => {
 
   const { jobId } = req.body;
 
-  // ✅ IMPORTANT: ici jobId finit par -fp, on log le baseJobId
+  // ✅ FIX: logBundle(req, baseJobId)
   if (jobId) {
     const baseJobId = jobId.replace(/-fp$/, "");
-    logBundle(baseJobId, req.headers.origin);
+    logBundle(req, baseJobId);
   }
 
   if (!req.file) return res.status(400).json({ status: "error", message: "No file" });
@@ -625,7 +627,7 @@ app.post("/fingerprint/hum/upload", upload.single("file"), async (req, res) => {
 
   if (job.status === "done") {
     fs.unlink(req.file.path, () => {});
-    const urls = fpUrls(jobId);
+    const urls = fpUrls(req, jobId); // ✅ FIX: pass req
     return res.json({ status: "ok", jobId, message: "Déjà calculé", ...urls });
   }
 
@@ -635,7 +637,7 @@ app.post("/fingerprint/hum/upload", upload.single("file"), async (req, res) => {
   saveJob(type, jobId);
   pushLog(type, jobId, "Job fingerprint HUM démarré (UPLOAD).");
 
-  const urls = fpUrls(jobId);
+  const urls = fpUrls(req, jobId); // ✅ FIX: pass req
   res.json({ status: "ok", jobId, message: "Upload HUM accepté, traitement en cours", ...urls });
 
   const filePath = req.file.path;
@@ -742,7 +744,7 @@ app.post("/qbh/index/upload", upload.single("file"), async (req, res) => {
 
   pushLog(type, jobId, "QBH INDEX démarré (UPLOAD).");
 
-  const urls = qbhUrls(jobId);
+  const urls = qbhUrls(req, jobId); // ✅ FIX: pass req
   res.json({
     status: "ok",
     jobId,
@@ -792,7 +794,7 @@ app.post("/qbh/index/url", async (req, res) => {
 
   pushLog(type, jobId, "QBH INDEX démarré (URL).");
 
-  const urls = qbhUrls(jobId);
+  const urls = qbhUrls(req, jobId); // ✅ FIX: pass req
   res.json({
     status: "ok",
     jobId,
@@ -847,7 +849,7 @@ app.post("/qbh/query/upload", upload.single("file"), async (req, res) => {
 
   pushLog(type, jobId, `QBH QUERY démarré (UPLOAD) candidates=${candidates.length}`);
 
-  const urls = qbhUrls(jobId);
+  const urls = qbhUrls(req, jobId); // ✅ FIX: pass req
   res.json({
     status: "ok",
     jobId,
@@ -907,7 +909,7 @@ app.post("/qbh/query/url", async (req, res) => {
 
   pushLog(type, jobId, `QBH QUERY démarré (URL) candidates=${cand.length}`);
 
-  const urls = qbhUrls(jobId);
+  const urls = qbhUrls(req, jobId); // ✅ FIX: pass req
   res.json({
     status: "ok",
     jobId,
@@ -956,10 +958,10 @@ app.post("/qbh/query/extract/upload", upload.single("file"), async (req, res) =>
 
   const { jobId } = req.body;
 
-  // ✅ IMPORTANT: ici jobId finit par -qbh, on log le baseJobId
+  // ✅ FIX: logBundle(req, baseJobId)
   if (jobId) {
     const baseJobId = jobId.replace(/-qbh$/, "");
-    logBundle(baseJobId, req.headers.origin);
+    logBundle(req, baseJobId);
   }
 
   if (!req.file) return res.status(400).json({ status: "error", message: "No file" });
@@ -974,7 +976,7 @@ app.post("/qbh/query/extract/upload", upload.single("file"), async (req, res) =>
 
   pushLog(type, jobId, "QBH QUERY EXTRACT démarré (UPLOAD).");
 
-  const urls = qbhUrls(jobId);
+  const urls = qbhUrls(req, jobId); // ✅ FIX: pass req
   res.json({
     status: "ok",
     jobId,
@@ -1106,7 +1108,6 @@ app.get("/bundle/:baseJobId", (req, res) => {
   if (payload.status === "error") return res.status(500).json(payload);
   return res.status(202).json(payload);
 });
-
 
 // =========================
 // Lancement serveur
