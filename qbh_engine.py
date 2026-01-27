@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# qbh_engine.py (UPDATED)
-# - garde 100% compat avec ton ancien format (melodySig/chromaSig + query/index)
-# - ajoute: hashes stables (sha256) pour DB Wix, métriques (voiced_ratio), versioning
-# - robustifie: parsing candidates, tolérance champs manquants, logs plus clairs
+# qbh_engine.py (UPDATED - FIX aliases)
+# - 100% compat ancien format (melodySig/chromaSig + query/index)
+# - ajoute: hashes sha256, voiced_ratio, versioning
+# - FIX: accepte alias mode=extract_query (vu dans tes logs Render)
 
 import sys, json, base64, traceback, os, tempfile, subprocess, hashlib
 import numpy as np
@@ -115,8 +115,7 @@ def extract_melody_sig(y: np.ndarray, sr: int, *, frames_per_sec=MELODY_FPS, fmi
     # mute non-voiced
     steps = (steps.astype(np.int16) * voiced.astype(np.int16)).astype(np.int8)
 
-    raw_bytes = steps.tobytes()
-    sig_hash = sha256_hex(raw_bytes)
+    sig_hash = sha256_hex(steps.tobytes())
 
     meta = {
         "type": "melody_delta_steps_int8",
@@ -127,13 +126,13 @@ def extract_melody_sig(y: np.ndarray, sr: int, *, frames_per_sec=MELODY_FPS, fmi
         "quant_cents_per_unit": 50,
         "backend": "yin",
         "voiced_ratio": float(voiced_ratio),
-        "sha256": sig_hash,  # ✅ utile DB Wix
+        "sha256": sig_hash,
     }
     return b64_encode_int8(steps), [int(steps.shape[0])], meta
 
 def extract_chroma_sig(y: np.ndarray, sr: int, *, frames_per_sec=CHROMA_FPS):
     """
-    ✅ Stable: chroma_stft (pas CQT)
+    ✅ Stable: chroma_stft
     Retour:
       b64(uint8 T,12), shape [T,12], meta (incl sha256)
     """
@@ -160,9 +159,7 @@ def extract_chroma_sig(y: np.ndarray, sr: int, *, frames_per_sec=CHROMA_FPS):
         chroma = chroma_sm
 
     chroma_q = np.clip(np.rint(chroma * 255.0), 0, 255).astype(np.uint8)
-
-    raw_bytes = chroma_q.tobytes()
-    sig_hash = sha256_hex(raw_bytes)
+    sig_hash = sha256_hex(chroma_q.tobytes())
 
     meta = {
         "type": "chroma_stft_uint8",
@@ -171,7 +168,7 @@ def extract_chroma_sig(y: np.ndarray, sr: int, *, frames_per_sec=CHROMA_FPS):
         "frames_per_sec": float(frames_per_sec),
         "T": int(chroma_q.shape[0]),
         "backend": "stft",
-        "sha256": sig_hash,  # ✅ utile DB Wix
+        "sha256": sig_hash,
     }
     return b64_encode_uint8(chroma_q), [int(chroma_q.shape[0]), 12], meta
 
@@ -228,12 +225,6 @@ def score_melody(query_steps: np.ndarray, track_steps: np.ndarray):
     return float(dtw_distance(q, t, window=w))
 
 def parse_candidates(raw):
-    """
-    candidates peut arriver:
-      - list (déjà)
-      - string JSON
-      - sinon -> []
-    """
     if raw is None:
         return []
     if isinstance(raw, list):
@@ -248,11 +239,34 @@ def parse_candidates(raw):
             return []
     return []
 
+def normalize_mode(mode_raw: str) -> str:
+    """
+    ✅ FIX principal:
+      - accepte "extract_query" (tes logs Render) comme alias de "query_extract"
+      - accepte variantes style "query-extract", "queryExtract", etc.
+    """
+    m = (mode_raw or "").strip()
+    if not m:
+        return ""
+    m = m.replace("-", "_").replace(" ", "_").lower()
+
+    aliases = {
+        "extract_query": "query_extract",
+        "queryextract": "query_extract",
+        "query_extract": "query_extract",
+        "query_extraction": "query_extract",
+        "extractquery": "query_extract",
+        "index": "index",
+        "query": "query",
+    }
+    return aliases.get(m, m)
+
 def main():
     wav_tmp = None
     try:
         payload = json.loads(sys.stdin.read() or "{}")
-        mode = (payload.get("mode") or "").strip().lower()
+
+        mode = normalize_mode(payload.get("mode"))
         if mode not in ("index", "query", "query_extract"):
             fail("mode must be one of: index | query | query_extract")
 
@@ -271,39 +285,35 @@ def main():
         dur = float(len(y) / max(float(sr), 1.0))
         log(f"✅ Loaded: {dur:.2f}s @ sr={sr}")
 
-        # ---- Extract A melody
         log("🧠 Extracting Option A (melodySig)...")
         try:
             melody_b64, melody_shape, melody_meta = extract_melody_sig(y, sr)
         except Exception as e:
             log("⚠️ Melody extraction failed (fallback empty): " + str(e))
-            melody_b64, melody_shape, melody_meta = "", [0], {"type": "melody_failed", "error": str(e), "sha256": None}
+            melody_b64, melody_shape, melody_meta = "", [0], {"type": "melody_failed", "error": str(e), "sha256": None, "voiced_ratio": 0.0}
 
-        # ---- Extract B chroma
         log("🎼 Extracting Option B (chromaSig)...")
         chroma_b64, chroma_shape, chroma_meta = extract_chroma_sig(y, sr)
 
-        # ---- index / query_extract (compat)
+        # index / query_extract
         if mode in ("index", "query_extract"):
             out = {
                 "status": "ok",
-                "mode": mode,
+                "mode": mode,  # ✅ mode normalisé
                 "version": ENGINE_VERSION,
                 "audio": {"sr": int(sr), "duration_sec": float(dur), "max_seconds": float(max_seconds)},
                 "melodySig": {"b64": melody_b64, "shape": melody_shape, "meta": melody_meta},
                 "chromaSig": {"b64": chroma_b64, "shape": chroma_shape, "meta": chroma_meta},
-
-                # ✅ champs bonus DB Wix (faciles à indexer)
                 "qbh_hash": {
                     "melody_sha256": melody_meta.get("sha256") if isinstance(melody_meta, dict) else None,
                     "chroma_sha256": chroma_meta.get("sha256") if isinstance(chroma_meta, dict) else None,
-                }
+                },
             }
             sys.stdout.write(json.dumps(out))
             sys.stdout.flush()
             return
 
-        # ---- query mode
+        # query mode
         candidates = parse_candidates(payload.get("candidates", []))
         if not isinstance(candidates, list) or len(candidates) == 0:
             fail("query mode requires non-empty candidates list")
@@ -329,7 +339,6 @@ def main():
             s_chr = None
             best_shift = None
 
-            # melody score
             if q_mel is not None and isinstance(tm, dict) and tm.get("b64") and tm.get("shape") and tm["shape"][0] > 0:
                 try:
                     t_mel = b64_decode_int8(tm["b64"], (tm["shape"][0],))
@@ -337,7 +346,6 @@ def main():
                 except Exception:
                     s_mel = None
 
-            # chroma score
             if isinstance(tc, dict) and tc.get("b64") and tc.get("shape") and tc["shape"][0] > 0:
                 try:
                     t_chr = b64_decode_uint8(tc["b64"], (tc["shape"][0], 12)).astype(np.float32) / 255.0
@@ -372,8 +380,6 @@ def main():
             "audio": {"sr": int(sr), "duration_sec": float(dur), "max_seconds": float(max_seconds)},
             "count": int(len(results)),
             "top": results[:top_k],
-
-            # ✅ renvoyer aussi les signatures du query si tu veux les stocker côté Wix
             "querySig": {
                 "melodySig": {"b64": melody_b64, "shape": melody_shape, "meta": melody_meta},
                 "chromaSig": {"b64": chroma_b64, "shape": chroma_shape, "meta": chroma_meta},
