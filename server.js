@@ -22,6 +22,9 @@ const __dirname = dirname(__filename);
 
 const app = express();
 
+// ✅ IMPORTANT sur Render / proxy (proto/host)
+app.set("trust proxy", 1);
+
 // =========================
 // CORS (Render Front + Wix + Dev)
 // =========================
@@ -182,6 +185,7 @@ setInterval(() => {
 // =========================
 
 // ✅ FIX: absUrl manquant (cause du ReferenceError)
+// + gère Render proxy + possibilité de forcer PUBLIC_BASE_URL
 function absUrl(req, maybeUrl) {
   if (!maybeUrl) return null;
 
@@ -189,8 +193,8 @@ function absUrl(req, maybeUrl) {
   if (/^https?:\/\//i.test(maybeUrl)) return maybeUrl;
 
   // derrière proxy (Render)
-  const proto = (req.headers["x-forwarded-proto"] || req.protocol || "https").toString();
-  const host = (req.headers["x-forwarded-host"] || req.get("host")).toString();
+  const proto = (req.headers["x-forwarded-proto"] || req.protocol || "https").toString().split(",")[0].trim();
+  const host = (req.headers["x-forwarded-host"] || req.get("host")).toString().split(",")[0].trim();
 
   // possibilité de forcer une base publique
   const base = process.env.PUBLIC_BASE_URL || `${proto}://${host}`;
@@ -439,10 +443,13 @@ app.post("/melody/upload", upload.single("file"), async (req, res) => {
       saveJob(type, jobId);
 
       fs.unlink(filePath, () => {});
-      const urls = auddUrls(req, jobId); // ✅ ABSOLUTES
+
+      // ✅ IMPORTANT: on renvoie aussi le bundleUrl ABSOLU (c'est ça que Wix doit fetch)
+      const urls = auddUrls(req, jobId);
       return res.json({
         status: "ok",
         jobId,
+        bundleUrl: absUrl(req, `/bundle/${jobId}`),
         ...urls,
         message: "AUdD OK",
       });
@@ -478,6 +485,7 @@ app.get("/melody/result/:jobId", (req, res) => {
     return res.status(202).json({
       status: job.status,
       jobId,
+      bundleUrl: absUrl(req, `/bundle/${jobId}`),
       ...urls,
       message: "Pas prêt",
     });
@@ -507,7 +515,7 @@ app.post("/fingerprint/url", async (req, res) => {
   const job = ensureJob(type, jobId);
 
   if (job.status === "done" || job.status === "processing") {
-    const urls = fpUrls(req, jobId); // ✅ FIX: pass req
+    const urls = fpUrls(req, jobId);
     return res.json({
       status: "ok",
       jobId,
@@ -524,7 +532,7 @@ app.post("/fingerprint/url", async (req, res) => {
   pushLog(type, jobId, "Job fingerprint démarré (URL).");
   const tmpFile = `/tmp/${jobId}.audio`;
 
-  const urls = fpUrls(req, jobId); // ✅ FIX: pass req
+  const urls = fpUrls(req, jobId);
   res.json({
     status: "ok",
     jobId,
@@ -569,7 +577,7 @@ app.post("/fingerprint/upload", upload.single("file"), async (req, res) => {
 
   if (job.status === "done") {
     fs.unlink(req.file.path, () => {});
-    const urls = fpUrls(req, jobId); // ✅ FIX: pass req
+    const urls = fpUrls(req, jobId);
     return res.json({ status: "ok", jobId, message: "Déjà calculé", ...urls });
   }
 
@@ -579,7 +587,7 @@ app.post("/fingerprint/upload", upload.single("file"), async (req, res) => {
   saveJob(type, jobId);
   pushLog(type, jobId, "Job fingerprint démarré (UPLOAD).");
 
-  const urls = fpUrls(req, jobId); // ✅ FIX: pass req
+  const urls = fpUrls(req, jobId);
   res.json({ status: "ok", jobId, message: "Upload accepté, traitement en cours", ...urls });
 
   const filePath = req.file.path;
@@ -614,8 +622,9 @@ app.post("/fingerprint/hum/upload", upload.single("file"), async (req, res) => {
   const { jobId } = req.body;
 
   // ✅ FIX: logBundle(req, baseJobId)
+  let baseJobId = null;
   if (jobId) {
-    const baseJobId = jobId.replace(/-fp$/, "");
+    baseJobId = jobId.replace(/-fp$/, "");
     logBundle(req, baseJobId);
   }
 
@@ -627,8 +636,15 @@ app.post("/fingerprint/hum/upload", upload.single("file"), async (req, res) => {
 
   if (job.status === "done") {
     fs.unlink(req.file.path, () => {});
-    const urls = fpUrls(req, jobId); // ✅ FIX: pass req
-    return res.json({ status: "ok", jobId, message: "Déjà calculé", ...urls });
+    const urls = fpUrls(req, jobId);
+    return res.json({
+      status: "ok",
+      jobId,
+      baseJobId,
+      bundleUrl: baseJobId ? absUrl(req, `/bundle/${baseJobId}`) : null,
+      message: "Déjà calculé",
+      ...urls,
+    });
   }
 
   job.status = "processing";
@@ -637,8 +653,16 @@ app.post("/fingerprint/hum/upload", upload.single("file"), async (req, res) => {
   saveJob(type, jobId);
   pushLog(type, jobId, "Job fingerprint HUM démarré (UPLOAD).");
 
-  const urls = fpUrls(req, jobId); // ✅ FIX: pass req
-  res.json({ status: "ok", jobId, message: "Upload HUM accepté, traitement en cours", ...urls });
+  const urls = fpUrls(req, jobId);
+  res.json({
+    status: "ok",
+    jobId,
+    baseJobId,
+    // ✅ IMPORTANT: Wix peut garder DIRECTEMENT cette URL-là
+    bundleUrl: baseJobId ? absUrl(req, `/bundle/${baseJobId}`) : null,
+    message: "Upload HUM accepté, traitement en cours",
+    ...urls,
+  });
 
   const filePath = req.file.path;
 
@@ -674,7 +698,12 @@ app.get("/fingerprint/:jobId", (req, res) => {
   if (!job) return res.status(404).json({ status: "error", message: "JobID inconnu" });
   resultsByJobKey[jobKey(type, jobId)] = job;
 
-  return res.json({ status: job.status, jobId, resultUrl: `/fingerprint/result/${jobId}` });
+  // ✅ cohérence : URLs absolues
+  return res.json({
+    status: job.status,
+    jobId,
+    resultUrl: absUrl(req, `/fingerprint/result/${jobId}`),
+  });
 });
 
 app.get("/fingerprint/result/:jobId", (req, res) => {
@@ -744,7 +773,7 @@ app.post("/qbh/index/upload", upload.single("file"), async (req, res) => {
 
   pushLog(type, jobId, "QBH INDEX démarré (UPLOAD).");
 
-  const urls = qbhUrls(req, jobId); // ✅ FIX: pass req
+  const urls = qbhUrls(req, jobId);
   res.json({
     status: "ok",
     jobId,
@@ -794,7 +823,7 @@ app.post("/qbh/index/url", async (req, res) => {
 
   pushLog(type, jobId, "QBH INDEX démarré (URL).");
 
-  const urls = qbhUrls(req, jobId); // ✅ FIX: pass req
+  const urls = qbhUrls(req, jobId);
   res.json({
     status: "ok",
     jobId,
@@ -849,7 +878,7 @@ app.post("/qbh/query/upload", upload.single("file"), async (req, res) => {
 
   pushLog(type, jobId, `QBH QUERY démarré (UPLOAD) candidates=${candidates.length}`);
 
-  const urls = qbhUrls(req, jobId); // ✅ FIX: pass req
+  const urls = qbhUrls(req, jobId);
   res.json({
     status: "ok",
     jobId,
@@ -909,7 +938,7 @@ app.post("/qbh/query/url", async (req, res) => {
 
   pushLog(type, jobId, `QBH QUERY démarré (URL) candidates=${cand.length}`);
 
-  const urls = qbhUrls(req, jobId); // ✅ FIX: pass req
+  const urls = qbhUrls(req, jobId);
   res.json({
     status: "ok",
     jobId,
@@ -959,8 +988,9 @@ app.post("/qbh/query/extract/upload", upload.single("file"), async (req, res) =>
   const { jobId } = req.body;
 
   // ✅ FIX: logBundle(req, baseJobId)
+  let baseJobId = null;
   if (jobId) {
-    const baseJobId = jobId.replace(/-qbh$/, "");
+    baseJobId = jobId.replace(/-qbh$/, "");
     logBundle(req, baseJobId);
   }
 
@@ -976,10 +1006,13 @@ app.post("/qbh/query/extract/upload", upload.single("file"), async (req, res) =>
 
   pushLog(type, jobId, "QBH QUERY EXTRACT démarré (UPLOAD).");
 
-  const urls = qbhUrls(req, jobId); // ✅ FIX: pass req
+  const urls = qbhUrls(req, jobId);
   res.json({
     status: "ok",
     jobId,
+    baseJobId,
+    // ✅ IMPORTANT: Wix peut garder DIRECTEMENT cette URL-là
+    bundleUrl: baseJobId ? absUrl(req, `/bundle/${baseJobId}`) : null,
     message: "QBH query extract accepté",
     ...urls,
   });
@@ -1025,7 +1058,11 @@ app.get("/qbh/:jobId", (req, res) => {
   if (!job) return res.status(404).json({ status: "error", message: "JobID inconnu" });
   resultsByJobKey[jobKey(type, jobId)] = job;
 
-  return res.json({ status: job.status, jobId, resultUrl: `/qbh/result/${jobId}` });
+  return res.json({
+    status: job.status,
+    jobId,
+    resultUrl: absUrl(req, `/qbh/result/${jobId}`),
+  });
 });
 
 app.get("/qbh/result/:jobId", (req, res) => {
