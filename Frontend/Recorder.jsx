@@ -12,9 +12,9 @@ const RECORD_MS = 7000;
 // ✅ helper: jobIds dédiés (pas de collision)
 const makeJobIds = (baseJobId) => ({
   base: baseJobId,
-  audd: baseJobId,             // AUdD garde jobId base
-  fp: `${baseJobId}-fp`,       // fingerprint
-  qbh: `${baseJobId}-qbh`,     // qbh
+  audd: baseJobId,        // AUdD garde jobId base
+  fp: `${baseJobId}-fp`,  // fingerprint
+  qbh: `${baseJobId}-qbh` // qbh
 });
 
 export default function Recorder() {
@@ -158,6 +158,7 @@ export default function Recorder() {
 
   // ============================================================
   // Envoi en parallèle: AUdD + Fingerprint(HUM) + QBH(EXTRACT_QUERY)
+  // + Retour vers Wix avec bundleUrl (/bundle/:baseJobId)
   // ============================================================
   const sendAudio = async (blob, ids) => {
     if (!blob || !ids?.base) return;
@@ -172,23 +173,21 @@ export default function Recorder() {
     const auddUploadUrl = `${apiUrl}/melody/upload?backend=audd`;
 
     // =========================
-    // Fingerprint HUM (nouvelle route)
+    // Fingerprint HUM
     // =========================
     const fdFp = new FormData();
     fdFp.append("file", blob, "recording.webm");
     fdFp.append("jobId", ids.fp);
 
-    // ✅ si ton server.js a /fingerprint/hum/upload, on l'utilise
     const fpUploadUrl = `${apiUrl}/fingerprint/hum/upload`;
 
     // =========================
-    // QBH extract query (nouvelle route)
+    // QBH extract query
     // =========================
     const fdQbh = new FormData();
     fdQbh.append("file", blob, "recording.webm");
     fdQbh.append("jobId", ids.qbh);
 
-    // ✅ si ton server.js a /qbh/query/extract/upload, on l'utilise
     const qbhUploadUrl = `${apiUrl}/qbh/query/extract/upload`;
 
     console.log("➡️ AUdD upload =>", auddUploadUrl, ids.audd);
@@ -204,7 +203,7 @@ export default function Recorder() {
     ]);
 
     // -------------------------
-    // AUdD result
+    // AUdD result (comme avant)
     // -------------------------
     let auddOk = false;
     let auddResultUrl = null;
@@ -227,14 +226,13 @@ export default function Recorder() {
     }
 
     // -------------------------
-    // Fingerprint polling + fetch final JSON
+    // Fingerprint polling + fetch final JSON (comme avant)
     // -------------------------
     let fpOk = false;
     let fpResultUrl = `${apiUrl}/fingerprint/result/${ids.fp}`;
     let fpLogsUrl = `${apiUrl}/fingerprint/logs/${ids.fp}`;
     let fpUploadInfo = null;
 
-    // champs utiles pour Wix (DB match)
     let fpSignatureOk = false;
     let fpMelodyHash = null;
     let fpVoicedRatio = null;
@@ -248,19 +246,26 @@ export default function Recorder() {
       if (res.ok) {
         fpOk = true;
 
-        if (json?.resultUrl) fpResultUrl = `${apiUrl}${json.resultUrl}`;
-        if (json?.logsUrl) fpLogsUrl = `${apiUrl}${json.logsUrl}`;
+        // Important: ces champs viennent parfois déjà absolus,
+        // donc on ne préfixe QUE si c'est relatif.
+        if (json?.resultUrl) {
+          fpResultUrl = json.resultUrl.startsWith("http") ? json.resultUrl : `${apiUrl}${json.resultUrl}`;
+        }
+        if (json?.logsUrl) {
+          fpLogsUrl = json.logsUrl.startsWith("http") ? json.logsUrl : `${apiUrl}${json.logsUrl}`;
+        }
 
         try {
           const pollData = await pollJob(ids.fp, "/fingerprint");
-          const finalUrl = pollData?.resultUrl ? `${apiUrl}${pollData.resultUrl}` : fpResultUrl;
+          const finalUrl = pollData?.resultUrl
+            ? (pollData.resultUrl.startsWith("http") ? pollData.resultUrl : `${apiUrl}${pollData.resultUrl}`)
+            : fpResultUrl;
 
           const finalRes = await fetch(finalUrl, { cache: "no-store" });
           const finalJson = await finalRes.json();
 
           fpResultUrl = finalUrl;
 
-          // ✅ on lit "melody" si présent (à adapter si ton JSON diffère)
           const melody = finalJson?.melody || null;
           fpSignatureOk = Boolean(melody?.melody_ok);
           fpMelodyHash = melody?.melody_hash || null;
@@ -279,15 +284,14 @@ export default function Recorder() {
     }
 
     // -------------------------
-    // QBH polling + fetch final JSON
+    // QBH polling + fetch final JSON (comme avant)
     // -------------------------
     let qbhOk = false;
     let qbhResultUrl = `${apiUrl}/qbh/result/${ids.qbh}`;
     let qbhLogsUrl = `${apiUrl}/qbh/logs/${ids.qbh}`;
     let qbhUploadInfo = null;
 
-    // champs utiles pour Wix (comparaison QBH côté Wix)
-    let qbhQuery = null;        // ex: contour / list
+    let qbhQuery = null;
     let qbhQueryLen = null;
     let qbhMeta = null;
 
@@ -299,24 +303,27 @@ export default function Recorder() {
       if (res.ok) {
         qbhOk = true;
 
-        if (json?.resultUrl) qbhResultUrl = `${apiUrl}${json.resultUrl}`;
-        if (json?.logsUrl) qbhLogsUrl = `${apiUrl}${json.logsUrl}`;
+        if (json?.resultUrl) {
+          qbhResultUrl = json.resultUrl.startsWith("http") ? json.resultUrl : `${apiUrl}${json.resultUrl}`;
+        }
+        if (json?.logsUrl) {
+          qbhLogsUrl = json.logsUrl.startsWith("http") ? json.logsUrl : `${apiUrl}${json.logsUrl}`;
+        }
 
         try {
           const pollData = await pollJob(ids.qbh, "/qbh");
-          const finalUrl = pollData?.resultUrl ? `${apiUrl}${pollData.resultUrl}` : qbhResultUrl;
+          const finalUrl = pollData?.resultUrl
+            ? (pollData.resultUrl.startsWith("http") ? pollData.resultUrl : `${apiUrl}${pollData.resultUrl}`)
+            : qbhResultUrl;
+
           qbhResultUrl = finalUrl;
 
-          // ✅ on fetch le JSON final pour extraire la query
           const finalRes = await fetch(finalUrl, { cache: "no-store" });
           const finalJson = await finalRes.json();
 
-          // on s'attend à { query: [...], ... } ou { q: [...] }
           const query = finalJson?.query ?? finalJson?.q ?? null;
           qbhQuery = query;
           qbhQueryLen = Array.isArray(query) ? query.length : null;
-
-          // garde d'autres infos si dispo
           qbhMeta = finalJson?.meta ?? null;
         } catch (e) {
           qbhOk = false;
@@ -331,6 +338,11 @@ export default function Recorder() {
     }
 
     // -------------------------
+    // ✅ URL BUNDLE UNIQUE (3 réponses fusionnées par server.js)
+    // -------------------------
+    const bundleUrl = `${apiUrl}/bundle/${ids.base}`;
+
+    // -------------------------
     // Status global
     // -------------------------
     const okCount = [auddOk, fpOk, qbhOk].filter(Boolean).length;
@@ -340,6 +352,9 @@ export default function Recorder() {
 
     const out = {
       jobId: ids.base,
+
+      // ✅ bundle unique
+      bundleUrl,
 
       // AUdD
       auddUploadUrl,
@@ -371,17 +386,20 @@ export default function Recorder() {
     setResult(out);
 
     // -------------------------
-    // Retour Wix (returnUrl)
+    // ✅ Retour Wix (returnUrl) : on met bundleUrl (et on garde l'ancien pour compat)
     // -------------------------
     if (returnUrl) {
       try {
         const wixUrl = new URL(decodeURIComponent(returnUrl));
         wixUrl.searchParams.set("jobId", ids.base);
 
-        // AUdD
+        // ✅ NOUVEAU : Wix doit fetcher cette URL pour obtenir les 3 résultats
+        wixUrl.searchParams.set("bundleUrl", bundleUrl);
+
+        // (Compat ancien frontend)
         if (auddResultUrl) wixUrl.searchParams.set("resultUrl", auddResultUrl);
 
-        // Fingerprint
+        // On peut garder fp/qbh séparés aussi (debug/compat)
         wixUrl.searchParams.set("fpJobId", ids.fp);
         wixUrl.searchParams.set("fpResultUrl", fpResultUrl);
         wixUrl.searchParams.set("fpLogsUrl", fpLogsUrl);
@@ -390,18 +408,18 @@ export default function Recorder() {
         if (fpVoicedRatio != null) wixUrl.searchParams.set("fpVoicedRatio", String(fpVoicedRatio));
         if (fpSignatureLen != null) wixUrl.searchParams.set("fpSignatureLen", String(fpSignatureLen));
 
-        // QBH
         wixUrl.searchParams.set("qbhJobId", ids.qbh);
         wixUrl.searchParams.set("qbhResultUrl", qbhResultUrl);
         wixUrl.searchParams.set("qbhLogsUrl", qbhLogsUrl);
         if (qbhQueryLen != null) wixUrl.searchParams.set("qbhQueryLen", String(qbhQueryLen));
 
-        // ⚠️ on évite de mettre qbhQuery complet dans l'URL si c'est gros.
-        // Wix récupère le JSON via qbhResultUrl (fetch côté .jsw).
         window.location.href = wixUrl.toString();
       } catch (err) {
         console.error("Erreur parsing returnUrl Wix :", err);
       }
+    } else {
+      // fallback debug
+      console.log("bundleUrl:", bundleUrl);
     }
   };
 
@@ -429,6 +447,15 @@ export default function Recorder() {
         <div className="result">
           <p>
             <b>JobID :</b> {result.jobId}
+          </p>
+
+          <hr />
+          <h4>BUNDLE (3 résultats fusionnés)</h4>
+          <p>
+            <b>JSON :</b>{" "}
+            <a href={result.bundleUrl} target="_blank" rel="noopener noreferrer">
+              {result.bundleUrl}
+            </a>
           </p>
 
           <hr />
