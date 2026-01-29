@@ -1,14 +1,28 @@
 #!/usr/bin/env python3
-import sys, json, base64, traceback, os, tempfile, subprocess, hashlib
+# qbh_engine.py / qbh.py (patched to avoid SIGSEGV on Render-like envs)
+
+import os
+
+# ============================================================
+# 🔒 Anti-SIGSEGV guards (must be set BEFORE importing numpy/librosa)
+# ============================================================
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("NUMBA_DISABLE_JIT", "1")  # librosa can trigger numba paths in some envs
+
+import sys, json, base64, traceback, tempfile, subprocess, hashlib
 import numpy as np
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 
 DEFAULT_SR = 22050
 DEFAULT_MAX_SECONDS = 12.0
 MELODY_FPS = 15
 CHROMA_FPS = 4
 
-ENGINE_VERSION = "qbh_engine_v3_2026-01-29"
+ENGINE_VERSION = "qbh_engine_v4_2026-01-29-safe"
 
 INDEX_WINDOW_SECONDS = 7.0
 INDEX_HOP_SECONDS = 1.0
@@ -67,9 +81,11 @@ def convert_to_wav(input_path: str, sr: int, max_seconds: float, start_sec: floa
     out_path = tempfile.mktemp(suffix=".wav")
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-threads", "1",
         "-ss", str(float(start_sec)),
         "-i", input_path,
         "-t", str(float(max_seconds)),
+        "-vn", "-sn", "-dn",
         "-ac", "1",
         "-ar", str(int(sr)),
         out_path,
@@ -86,22 +102,55 @@ def load_audio(path: str, sr=DEFAULT_SR, mono=True, max_seconds=DEFAULT_MAX_SECO
         y = y[: int(float(max_seconds) * sr)]
     return y.astype(np.float32, copy=False), sr
 
+# ============================================================
+# ✅ Melody extraction: use piptrack (avoid librosa.yin -> numba/segfault risk)
+# Output stays compatible: int8 delta steps with voiced mask
+# ============================================================
 def extract_melody_sig(y: np.ndarray, sr: int, *, frames_per_sec=MELODY_FPS, fmin=80.0, fmax=1000.0):
     import librosa
-    hop = int(sr / frames_per_sec)
-    hop = max(256, min(hop, 2048))
 
-    f0 = librosa.yin(y, fmin=fmin, fmax=fmax, sr=sr, hop_length=hop)
+    hop = int(sr / float(frames_per_sec))
+    hop = max(256, min(hop, 2048))
+    n_fft = 2048
+
+    # Magnitude spectrogram
+    S = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=hop, center=True))
+    pitches, mags = librosa.piptrack(S=S, sr=sr, n_fft=n_fft, hop_length=hop, fmin=fmin, fmax=fmax)
+
+    # For each frame: pick pitch bin with max magnitude
+    T = pitches.shape[1] if pitches.ndim == 2 else 0
+    if T <= 0:
+        steps = np.zeros((0,), dtype=np.int8)
+        meta = {
+            "type": "melody_delta_steps_int8",
+            "sr": int(sr),
+            "hop": int(hop),
+            "frames_per_sec": float(frames_per_sec),
+            "T": 0,
+            "quant_cents_per_unit": 50,
+            "backend": "piptrack",
+            "voiced_ratio": 0.0,
+            "sha256": sha256_hex(b""),
+        }
+        return b64_encode_int8(steps), [0], meta
+
+    idx = np.argmax(mags, axis=0)               # (T,)
+    f0 = pitches[idx, np.arange(T)]             # (T,)
     f0 = np.nan_to_num(f0, nan=0.0).astype(np.float32)
 
-    voiced = (f0 > 0.0).astype(np.float32)
+    # voiced decision: magnitude threshold relative to median of max-mags
+    maxmag = mags[idx, np.arange(T)].astype(np.float32)
+    thr = float(np.median(maxmag) * 0.15) if maxmag.size else 0.0
+    voiced = ((f0 > 0.0) & (maxmag > thr)).astype(np.float32)
     voiced_ratio = float(np.mean(voiced)) if voiced.size else 0.0
 
+    # cents representation (relative to ref)
     ref = 55.0
     cents = np.zeros_like(f0, dtype=np.float32)
-    nz = f0 > 0
+    nz = (f0 > 0.0) & (voiced > 0.0)
     cents[nz] = 1200.0 * np.log2(f0[nz] / ref)
 
+    # smooth cents a bit (median filter length 5)
     if cents.size >= 5:
         k = 5
         pad = k // 2
@@ -113,7 +162,7 @@ def extract_melody_sig(y: np.ndarray, sr: int, *, frames_per_sec=MELODY_FPS, fmi
 
     if np.any(nz):
         med = np.median(cents[nz])
-        cents = cents - med
+        cents = cents - float(med)
 
     dc = np.diff(cents, prepend=cents[:1])
     dc = np.clip(dc, -400.0, 400.0)
@@ -130,20 +179,22 @@ def extract_melody_sig(y: np.ndarray, sr: int, *, frames_per_sec=MELODY_FPS, fmi
         "frames_per_sec": float(frames_per_sec),
         "T": int(steps.shape[0]),
         "quant_cents_per_unit": 50,
-        "backend": "yin",
+        "backend": "piptrack",
         "voiced_ratio": float(voiced_ratio),
         "sha256": sig_hash,
+        "mag_thr": float(thr),
     }
     return b64_encode_int8(steps), [int(steps.shape[0])], meta
 
 def extract_chroma_sig(y: np.ndarray, sr: int, *, frames_per_sec=CHROMA_FPS):
     import librosa
-    hop = int(sr / frames_per_sec)
+
+    hop = int(sr / float(frames_per_sec))
     hop = max(512, min(hop, 4096))
     n_fft = 4096
 
     chroma = librosa.feature.chroma_stft(y=y, sr=sr, hop_length=hop, n_fft=n_fft)
-    chroma = chroma.T
+    chroma = chroma.T  # (T,12)
     chroma = chroma / (np.sum(chroma, axis=1, keepdims=True) + 1e-8)
 
     if chroma.shape[0] >= 5:
@@ -229,7 +280,9 @@ def main():
         sr = int(payload.get("sr", DEFAULT_SR))
         max_seconds = float(payload.get("max_seconds", DEFAULT_MAX_SECONDS))
 
-        # NEW: index_full = windowed hashes across full track
+        # ============================================================
+        # index_full: windowed hashes across full track (for 7s anywhere)
+        # ============================================================
         if mode == "index_full":
             window_sec = float(payload.get("window_seconds", INDEX_WINDOW_SECONDS))
             hop_sec = float(payload.get("hop_seconds", INDEX_HOP_SECONDS))
@@ -240,6 +293,7 @@ def main():
 
             windows = []
             tmp_files = []
+
             for off in offs:
                 try:
                     wav = convert_to_wav(audio_path, sr=sr, max_seconds=window_sec + 0.25, start_sec=off)
@@ -251,6 +305,7 @@ def main():
                 if y.size < int(0.6 * sr2):
                     continue
 
+                # melody
                 try:
                     mel_b64, mel_shape, mel_meta = extract_melody_sig(y, sr2)
                     mel_sha = mel_meta.get("sha256") if isinstance(mel_meta, dict) else None
@@ -259,8 +314,12 @@ def main():
                     mel_sha = None
                     voiced_ratio = 0.0
 
-                chr_b64, chr_shape, chr_meta = extract_chroma_sig(y, sr2)
-                chr_sha = chr_meta.get("sha256") if isinstance(chr_meta, dict) else None
+                # chroma
+                try:
+                    chr_b64, chr_shape, chr_meta = extract_chroma_sig(y, sr2)
+                    chr_sha = chr_meta.get("sha256") if isinstance(chr_meta, dict) else None
+                except Exception:
+                    chr_sha = None
 
                 combo = f"{mel_sha or ''}|{chr_sha or ''}".encode("utf-8", errors="ignore")
                 win_hash = sha256_hex(combo) if (mel_sha or chr_sha) else None
@@ -290,14 +349,16 @@ def main():
                     "hop_sec": float(hop_sec),
                     "max_windows": int(max_w),
                     "count": int(len(windows)),
-                    "windows": windows
-                }
+                    "windows": windows,
+                },
             }
             sys.stdout.write(json.dumps(out))
             sys.stdout.flush()
             return
 
-        # original path: prepare wav for index/query_extract/query
+        # ============================================================
+        # index / query_extract / query : single segment path
+        # ============================================================
         log(f"🎧 Preparing audio: {audio_path} (mode={mode})")
         wav_tmp = convert_to_wav(audio_path, sr=sr, max_seconds=max_seconds, start_sec=0.0)
         y, sr = load_audio(wav_tmp, sr=sr, mono=True, max_seconds=max_seconds)
@@ -306,7 +367,13 @@ def main():
         try:
             melody_b64, melody_shape, melody_meta = extract_melody_sig(y, sr)
         except Exception as e:
-            melody_b64, melody_shape, melody_meta = "", [0], {"type": "melody_failed", "error": str(e), "sha256": None, "voiced_ratio": 0.0}
+            melody_b64, melody_shape, melody_meta = "", [0], {
+                "type": "melody_failed",
+                "error": str(e),
+                "sha256": None,
+                "voiced_ratio": 0.0,
+                "backend": "piptrack",
+            }
 
         chroma_b64, chroma_shape, chroma_meta = extract_chroma_sig(y, sr)
 
@@ -331,7 +398,9 @@ def main():
         if not isinstance(candidates, list) or len(candidates) == 0:
             fail("query mode requires non-empty candidates list")
 
-        # Query matching unchanged (DTW)
+        # ============================================================
+        # DTW matching (unchanged)
+        # ============================================================
         def dtw_distance(A: np.ndarray, B: np.ndarray, *, window=None) -> float:
             A = np.asarray(A)
             B = np.asarray(B)
