@@ -543,7 +543,7 @@ app.post("/fingerprint/url", async (req, res) => {
   (async () => {
     try {
       await downloadToFile(url, tmpFile, type, jobId);
-      const result = await runPythonFingerprint(tmpFile, type, jobId, ["--mode", "fp"]);
+      const result = await runPythonFingerprint(tmpFile, type, jobId, ["--mode", "full"]);
 
       const j = ensureJob(type, jobId);
       j.status = "done";
@@ -594,7 +594,7 @@ app.post("/fingerprint/upload", upload.single("file"), async (req, res) => {
 
   (async () => {
     try {
-      const result = await runPythonFingerprint(filePath, type, jobId, ["--mode", "fp"]);
+      const result = await runPythonFingerprint(filePath, type, jobId, ["--mode", "full"]);
 
       const j = ensureJob(type, jobId);
       j.status = "done";
