@@ -78,6 +78,18 @@ const pythonQbhPath = path.join(__dirname, "qbh_engine.py");
 const API_TOKEN = "3523e792bbced184caa4f51a33a2494a";
 
 // =========================
+// ✅ IMPORTANT: paramètres "7s" pour indexation DB Wix
+// - On indexe les musiques importées (publicUrl/importAudio) en ~7-8s
+// - Recorder.jsx (hum) est déjà court => on aligne tout
+// =========================
+const FP_INDEX_MODE = (process.env.FP_INDEX_MODE || "hum").toLowerCase(); // "hum" recommandé
+const QBH_MAX_SECONDS = (() => {
+  const v = Number(process.env.QBH_MAX_SECONDS || "8");
+  if (!Number.isFinite(v) || v <= 0) return 8;
+  return Math.min(Math.max(v, 3), 30);
+})();
+
+// =========================
 // SAFE PY ENV (STABLE NUMBA + ANTI THREAD CRASH)
 // =========================
 // ⚠️ IMPORTANT: on force cet env sur TOUS les spawn python
@@ -193,8 +205,14 @@ function absUrl(req, maybeUrl) {
   if (/^https?:\/\//i.test(maybeUrl)) return maybeUrl;
 
   // derrière proxy (Render)
-  const proto = (req.headers["x-forwarded-proto"] || req.protocol || "https").toString().split(",")[0].trim();
-  const host = (req.headers["x-forwarded-host"] || req.get("host")).toString().split(",")[0].trim();
+  const proto = (req.headers["x-forwarded-proto"] || req.protocol || "https")
+    .toString()
+    .split(",")[0]
+    .trim();
+  const host = (req.headers["x-forwarded-host"] || req.get("host"))
+    .toString()
+    .split(",")[0]
+    .trim();
 
   // possibilité de forcer une base publique
   const base = process.env.PUBLIC_BASE_URL || `${proto}://${host}`;
@@ -413,10 +431,8 @@ app.post("/melody/upload", upload.single("file"), async (req, res) => {
 
   const { jobId } = req.body;
 
-  // ✅ FIX: ordre des arguments (req, baseJobId)
   if (jobId) logBundle(req, jobId);
 
-  // ✅ FIX: par défaut c'est audd, pas python
   const backend = req.query.backend || "audd";
 
   if (!req.file) return res.status(400).json({ status: "error", message: "No file" });
@@ -444,7 +460,6 @@ app.post("/melody/upload", upload.single("file"), async (req, res) => {
 
       fs.unlink(filePath, () => {});
 
-      // ✅ IMPORTANT: on renvoie aussi le bundleUrl ABSOLU (c'est ça que Wix doit fetch)
       const urls = auddUrls(req, jobId);
       return res.json({
         status: "ok",
@@ -479,7 +494,6 @@ app.get("/melody/result/:jobId", (req, res) => {
 
   resultsByJobKey[jobKey(type, jobId)] = job;
 
-  // ✅ FIX: si pas encore prêt → 202 (pour polling)
   if (job.status === "processing" || job.status === "pending") {
     const urls = auddUrls(req, jobId);
     return res.status(202).json({
@@ -499,7 +513,6 @@ app.get("/melody/result/:jobId", (req, res) => {
     });
   }
 
-  // done
   return res.json(job.result);
 });
 
@@ -507,6 +520,8 @@ app.get("/melody/result/:jobId", (req, res) => {
 // VOIE A) Fingerprint
 // ============================================================
 
+// ✅ IMPORTANT: /fingerprint/url sert à l'indexation DB depuis publicUrl (importAudio)
+// => on force "hum" (7-8s) par défaut pour matcher Recorder.jsx
 app.post("/fingerprint/url", async (req, res) => {
   const { url, jobId } = req.body;
   if (!url || !jobId) return res.status(400).json({ status: "error", message: "URL or JobID missing" });
@@ -529,7 +544,7 @@ app.post("/fingerprint/url", async (req, res) => {
   job.result = null;
   saveJob(type, jobId);
 
-  pushLog(type, jobId, "Job fingerprint démarré (URL).");
+  pushLog(type, jobId, `Job fingerprint démarré (URL) mode=${FP_INDEX_MODE}.`);
   const tmpFile = `/tmp/${jobId}.audio`;
 
   const urls = fpUrls(req, jobId);
@@ -543,7 +558,9 @@ app.post("/fingerprint/url", async (req, res) => {
   (async () => {
     try {
       await downloadToFile(url, tmpFile, type, jobId);
-      const result = await runPythonFingerprint(tmpFile, type, jobId, ["--mode", "full"]);
+
+      const modeArg = FP_INDEX_MODE === "full" ? "full" : "hum";
+      const result = await runPythonFingerprint(tmpFile, type, jobId, ["--mode", modeArg]);
 
       const j = ensureJob(type, jobId);
       j.status = "done";
@@ -564,6 +581,8 @@ app.post("/fingerprint/url", async (req, res) => {
   })();
 });
 
+// ✅ IMPORTANT: /fingerprint/upload peut aussi être utilisé par importAudio (upload direct)
+// => on force "hum" (7-8s) par défaut pour matcher Recorder.jsx
 app.post("/fingerprint/upload", upload.single("file"), async (req, res) => {
   console.log("✅ HIT /fingerprint/upload", "origin=", req.headers.origin, "jobId=", req.body?.jobId);
 
@@ -585,7 +604,7 @@ app.post("/fingerprint/upload", upload.single("file"), async (req, res) => {
   job.error = null;
   job.result = null;
   saveJob(type, jobId);
-  pushLog(type, jobId, "Job fingerprint démarré (UPLOAD).");
+  pushLog(type, jobId, `Job fingerprint démarré (UPLOAD) mode=${FP_INDEX_MODE}.`);
 
   const urls = fpUrls(req, jobId);
   res.json({ status: "ok", jobId, message: "Upload accepté, traitement en cours", ...urls });
@@ -594,7 +613,8 @@ app.post("/fingerprint/upload", upload.single("file"), async (req, res) => {
 
   (async () => {
     try {
-      const result = await runPythonFingerprint(filePath, type, jobId, ["--mode", "full"]);
+      const modeArg = FP_INDEX_MODE === "full" ? "full" : "hum";
+      const result = await runPythonFingerprint(filePath, type, jobId, ["--mode", modeArg]);
 
       const j = ensureJob(type, jobId);
       j.status = "done";
@@ -615,13 +635,12 @@ app.post("/fingerprint/upload", upload.single("file"), async (req, res) => {
   })();
 });
 
-// ✅ ROUTE pour Recorder.jsx (chant/hum)
+// ✅ ROUTE pour Recorder.jsx (chant/hum) : reste en hum (déjà OK)
 app.post("/fingerprint/hum/upload", upload.single("file"), async (req, res) => {
   console.log("✅ HIT /fingerprint/hum/upload", "origin=", req.headers.origin, "jobId=", req.body?.jobId);
 
   const { jobId } = req.body;
 
-  // ✅ FIX: logBundle(req, baseJobId)
   let baseJobId = null;
   if (jobId) {
     baseJobId = jobId.replace(/-fp$/, "");
@@ -658,7 +677,6 @@ app.post("/fingerprint/hum/upload", upload.single("file"), async (req, res) => {
     status: "ok",
     jobId,
     baseJobId,
-    // ✅ IMPORTANT: Wix peut garder DIRECTEMENT cette URL-là
     bundleUrl: baseJobId ? absUrl(req, `/bundle/${baseJobId}`) : null,
     message: "Upload HUM accepté, traitement en cours",
     ...urls,
@@ -698,7 +716,6 @@ app.get("/fingerprint/:jobId", (req, res) => {
   if (!job) return res.status(404).json({ status: "error", message: "JobID inconnu" });
   resultsByJobKey[jobKey(type, jobId)] = job;
 
-  // ✅ cohérence : URLs absolues
   return res.json({
     status: job.status,
     jobId,
@@ -757,6 +774,7 @@ function parseCandidates(raw) {
 }
 
 // ----------- QBH INDEX (upload) -----------
+// ✅ IMPORTANT: indexation DB (importAudio) => max_seconds = QBH_MAX_SECONDS (7-8s)
 app.post("/qbh/index/upload", upload.single("file"), async (req, res) => {
   console.log("✅ HIT /qbh/index/upload", "origin=", req.headers.origin, "jobId=", req.body?.jobId);
 
@@ -771,7 +789,7 @@ app.post("/qbh/index/upload", upload.single("file"), async (req, res) => {
   job.result = null;
   saveJob(type, jobId);
 
-  pushLog(type, jobId, "QBH INDEX démarré (UPLOAD).");
+  pushLog(type, jobId, `QBH INDEX démarré (UPLOAD) max_seconds=${QBH_MAX_SECONDS}.`);
 
   const urls = qbhUrls(req, jobId);
   res.json({
@@ -785,7 +803,7 @@ app.post("/qbh/index/upload", upload.single("file"), async (req, res) => {
 
   (async () => {
     try {
-      const payload = { mode: "index", audio_path: filePath, sr: 22050, max_seconds: 12 };
+      const payload = { mode: "index", audio_path: filePath, sr: 22050, max_seconds: QBH_MAX_SECONDS };
       const result = await runPythonQBH(payload, type, jobId);
 
       const j = ensureJob(type, jobId);
@@ -808,6 +826,7 @@ app.post("/qbh/index/upload", upload.single("file"), async (req, res) => {
 });
 
 // ----------- QBH INDEX (url) -----------
+// ✅ IMPORTANT: indexation DB depuis publicUrl => max_seconds = QBH_MAX_SECONDS (7-8s)
 app.post("/qbh/index/url", async (req, res) => {
   const { url, jobId } = req.body;
   console.log("✅ HIT /qbh/index/url", "origin=", req.headers.origin, "jobId=", jobId);
@@ -821,7 +840,7 @@ app.post("/qbh/index/url", async (req, res) => {
   job.result = null;
   saveJob(type, jobId);
 
-  pushLog(type, jobId, "QBH INDEX démarré (URL).");
+  pushLog(type, jobId, `QBH INDEX démarré (URL) max_seconds=${QBH_MAX_SECONDS}.`);
 
   const urls = qbhUrls(req, jobId);
   res.json({
@@ -836,7 +855,7 @@ app.post("/qbh/index/url", async (req, res) => {
   (async () => {
     try {
       await downloadToFile(url, tmpFile, type, jobId);
-      const payload = { mode: "index", audio_path: tmpFile, sr: 22050, max_seconds: 12 };
+      const payload = { mode: "index", audio_path: tmpFile, sr: 22050, max_seconds: QBH_MAX_SECONDS };
       const result = await runPythonQBH(payload, type, jobId);
 
       const j = ensureJob(type, jobId);
@@ -859,6 +878,7 @@ app.post("/qbh/index/url", async (req, res) => {
 });
 
 // ----------- QBH QUERY (upload) -----------
+// ✅ Recorder.jsx / recherche => max_seconds = QBH_MAX_SECONDS (aligné 7-8s)
 app.post("/qbh/query/upload", upload.single("file"), async (req, res) => {
   console.log("✅ HIT /qbh/query/upload", "origin=", req.headers.origin, "jobId=", req.body?.jobId);
 
@@ -876,7 +896,7 @@ app.post("/qbh/query/upload", upload.single("file"), async (req, res) => {
   job.result = null;
   saveJob(type, jobId);
 
-  pushLog(type, jobId, `QBH QUERY démarré (UPLOAD) candidates=${candidates.length}`);
+  pushLog(type, jobId, `QBH QUERY démarré (UPLOAD) candidates=${candidates.length} max_seconds=${QBH_MAX_SECONDS}`);
 
   const urls = qbhUrls(req, jobId);
   res.json({
@@ -896,7 +916,7 @@ app.post("/qbh/query/upload", upload.single("file"), async (req, res) => {
         candidates,
         top_k: 10,
         sr: 22050,
-        max_seconds: 12,
+        max_seconds: QBH_MAX_SECONDS,
       };
       const result = await runPythonQBH(payload, type, jobId);
 
@@ -920,6 +940,7 @@ app.post("/qbh/query/upload", upload.single("file"), async (req, res) => {
 });
 
 // ----------- QBH QUERY (url) -----------
+// ✅ recherche via URL => max_seconds = QBH_MAX_SECONDS
 app.post("/qbh/query/url", async (req, res) => {
   const { url, jobId, candidates } = req.body;
   console.log("✅ HIT /qbh/query/url", "origin=", req.headers.origin, "jobId=", jobId);
@@ -936,7 +957,7 @@ app.post("/qbh/query/url", async (req, res) => {
   job.result = null;
   saveJob(type, jobId);
 
-  pushLog(type, jobId, `QBH QUERY démarré (URL) candidates=${cand.length}`);
+  pushLog(type, jobId, `QBH QUERY démarré (URL) candidates=${cand.length} max_seconds=${QBH_MAX_SECONDS}`);
 
   const urls = qbhUrls(req, jobId);
   res.json({
@@ -958,7 +979,7 @@ app.post("/qbh/query/url", async (req, res) => {
         candidates: cand,
         top_k: 10,
         sr: 22050,
-        max_seconds: 12,
+        max_seconds: QBH_MAX_SECONDS,
       };
       const result = await runPythonQBH(payload, type, jobId);
 
@@ -982,12 +1003,12 @@ app.post("/qbh/query/url", async (req, res) => {
 });
 
 // ✅ NOUVELLE ROUTE: extract QBH query (sans candidates) -> comparaison faite par Wix
+// ✅ Recorder.jsx => max_seconds = QBH_MAX_SECONDS (aligné 7-8s)
 app.post("/qbh/query/extract/upload", upload.single("file"), async (req, res) => {
   console.log("✅ HIT /qbh/query/extract/upload", "origin=", req.headers.origin, "jobId=", req.body?.jobId);
 
   const { jobId } = req.body;
 
-  // ✅ FIX: logBundle(req, baseJobId)
   let baseJobId = null;
   if (jobId) {
     baseJobId = jobId.replace(/-qbh$/, "");
@@ -1004,14 +1025,13 @@ app.post("/qbh/query/extract/upload", upload.single("file"), async (req, res) =>
   job.result = null;
   saveJob(type, jobId);
 
-  pushLog(type, jobId, "QBH QUERY EXTRACT démarré (UPLOAD).");
+  pushLog(type, jobId, `QBH QUERY EXTRACT démarré (UPLOAD) max_seconds=${QBH_MAX_SECONDS}.`);
 
   const urls = qbhUrls(req, jobId);
   res.json({
     status: "ok",
     jobId,
     baseJobId,
-    // ✅ IMPORTANT: Wix peut garder DIRECTEMENT cette URL-là
     bundleUrl: baseJobId ? absUrl(req, `/bundle/${baseJobId}`) : null,
     message: "QBH query extract accepté",
     ...urls,
@@ -1025,7 +1045,7 @@ app.post("/qbh/query/extract/upload", upload.single("file"), async (req, res) =>
         mode: "extract_query",
         audio_path: filePath,
         sr: 22050,
-        max_seconds: 12,
+        max_seconds: QBH_MAX_SECONDS,
       };
       const result = await runPythonQBH(payload, type, jobId);
 
@@ -1127,7 +1147,7 @@ app.get("/bundle/:baseJobId", (req, res) => {
   const payload = {
     status: allDone ? "done" : anyError ? "error" : "processing",
     baseJobId,
-    urls: bundleUrls(req, baseJobId), // ✅ ABSOLUTES
+    urls: bundleUrls(req, baseJobId),
     parts,
     results: {
       audd: auddJob?.status === "done" ? auddJob.result : null,
@@ -1150,4 +1170,6 @@ app.get("/bundle/:baseJobId", (req, res) => {
 // Lancement serveur
 // =========================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Node API running on port ${PORT}`));
+app.listen(PORT, () =>
+  console.log(`🚀 Node API running on port ${PORT} | FP_INDEX_MODE=${FP_INDEX_MODE} | QBH_MAX_SECONDS=${QBH_MAX_SECONDS}`)
+);
