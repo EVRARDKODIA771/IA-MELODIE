@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-# fingerprint.py — QBH feature extractor for BOTH:
-#   - query_extract: (Recorder.jsx file, usually 7s) -> features+hashes
-#   - index_full: (Wix imported full track) -> sliding windows 7s across track
+# fingerprint.py — QBH extractor + windowed indexer (Render-safe)
 #
-# Output JSON only on stdout. Logs only on stderr.
+# Supported modes:
+#   --mode hum          <audio>   (alias of query_extract, default max_seconds=8)
+#   --mode query_extract --max_seconds 7 --sr 22050 <audio>
+#   --mode index_full    --window_seconds 7 --hop_seconds 2 --max_windows 140 --sr 22050 <audio>
+#
+# stdout: JSON only
+# stderr: logs only
 
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -16,35 +20,37 @@ os.environ.setdefault("LIBROSA_DISABLE_NUMBA", "1")
 
 import sys, json, time, tempfile, subprocess, hashlib, traceback, base64
 from typing import Optional, List, Dict, Any, Tuple
-
 import numpy as np
 
 ENGINE_VERSION = "fingerprint_qbh_v2_2026-01-30"
 
 DEFAULT_SR = 22050
+
 DEFAULT_MAX_SECONDS_QUERY = 7.0
+DEFAULT_MAX_SECONDS_HUM = 8.0
 
 DEFAULT_WINDOW_SECONDS = 7.0
 DEFAULT_HOP_SECONDS = 2.0
 DEFAULT_MAX_WINDOWS = 140
 
-MELODY_FPS = 15   # ~15 frames/sec
-CHROMA_FPS = 4    # ~4 frames/sec
+MELODY_FPS = 15
+CHROMA_FPS = 4
 
-# -------------------------------------------------
-# stderr logger
-# -------------------------------------------------
+
 def log(msg: str):
     sys.stderr.write(msg + "\n")
     sys.stderr.flush()
 
+
 def sha256_hex(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
+
 
 def ok(payload: dict, code: int = 0) -> int:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False))
     sys.stdout.flush()
     return code
+
 
 def fail(msg: str, *, code: int = 1, extra: Optional[dict] = None) -> int:
     payload = {"ok": False, "error": msg, "version": ENGINE_VERSION}
@@ -54,9 +60,7 @@ def fail(msg: str, *, code: int = 1, extra: Optional[dict] = None) -> int:
     sys.stdout.flush()
     return code
 
-# -------------------------------------------------
-# args parser (no argparse)
-# -------------------------------------------------
+
 def parse_args(argv: List[str]):
     mode = "query_extract"
     file_path = None
@@ -110,8 +114,15 @@ def parse_args(argv: List[str]):
         i += 1
 
     mode = (mode or "").strip().lower().replace("-", "_")
+    # aliases
+    if mode == "hum":
+        mode = "query_extract"
+        if max_seconds == DEFAULT_MAX_SECONDS_QUERY:
+            max_seconds = DEFAULT_MAX_SECONDS_HUM
+
     if not file_path:
         return None, None, None, None, None, None, None, "missing file path"
+
     if mode not in ("query_extract", "index_full"):
         return None, None, None, None, None, None, None, f"unsupported mode: {mode}"
 
@@ -128,9 +139,7 @@ def parse_args(argv: List[str]):
 
     return file_path, mode, int(sr), float(max_seconds), float(window_seconds), float(hop_seconds), int(max_windows), None
 
-# -------------------------------------------------
-# ffprobe / ffmpeg
-# -------------------------------------------------
+
 def ffprobe_duration_seconds(input_path: str) -> Optional[float]:
     cmd = [
         "ffprobe", "-v", "error",
@@ -143,11 +152,10 @@ def ffprobe_duration_seconds(input_path: str) -> Optional[float]:
         if not out:
             return None
         d = float(out)
-        if d <= 0:
-            return None
-        return d
+        return d if d > 0 else None
     except Exception:
         return None
+
 
 def convert_to_wav_segment(input_path: str, sr: int, start_sec: float, max_seconds: float) -> str:
     out_path = tempfile.mktemp(suffix=".wav")
@@ -167,116 +175,36 @@ def convert_to_wav_segment(input_path: str, sr: int, start_sec: float, max_secon
         raise RuntimeError("ffmpeg produced empty wav")
     return out_path
 
-def load_wav_mono_float32(path: str, sr_expected: int, max_seconds: float) -> Tuple[np.ndarray, int]:
-    y = None
-    sr = sr_expected
-    try:
-        import soundfile as sf
-        y, sr = sf.read(path, dtype="float32", always_2d=False)
-        sr = int(sr) if sr else int(sr_expected)
-        if y is None:
-            y = np.zeros((0,), dtype=np.float32)
-        if getattr(y, "ndim", 1) > 1:
-            y = y[:, 0]
-    except Exception:
-        from scipy.io import wavfile
-        sr, y = wavfile.read(path)
-        sr = int(sr) if sr else int(sr_expected)
-        if getattr(y, "ndim", 1) > 1:
-            y = y[:, 0]
-        if y.dtype.kind in ("i", "u"):
-            y = y.astype(np.float32) / max(np.iinfo(y.dtype).max, 1)
-        else:
-            y = y.astype(np.float32, copy=False)
 
+def load_audio_librosa(path: str, sr: int, max_seconds: float) -> Tuple[np.ndarray, int]:
+    import librosa
+    y, sr2 = librosa.load(path, sr=sr, mono=True)
+    if y is None:
+        return np.zeros((0,), dtype=np.float32), sr
     if max_seconds is not None:
-        n = int(float(max_seconds) * float(sr))
+        n = int(float(max_seconds) * float(sr2))
         if y.size > n:
             y = y[:n]
-
+    y = y.astype(np.float32, copy=False)
     if y.size:
         m = float(np.max(np.abs(y)))
         if m > 1e-8:
             y = y / m
-    return y.astype(np.float32, copy=False), sr
+    return y, int(sr2)
 
-# -------------------------------------------------
-# base64 helpers (optional debug transport)
-# -------------------------------------------------
+
 def b64_encode_bytes(b: bytes) -> str:
     return base64.b64encode(b).decode("ascii")
 
+
 def b64_encode_int8(arr: np.ndarray) -> str:
-    arr = np.asarray(arr, dtype=np.int8)
-    return b64_encode_bytes(arr.tobytes())
+    return b64_encode_bytes(np.asarray(arr, dtype=np.int8).tobytes())
+
 
 def b64_encode_uint8(arr: np.ndarray) -> str:
-    arr = np.asarray(arr, dtype=np.uint8)
-    return b64_encode_bytes(arr.tobytes())
+    return b64_encode_bytes(np.asarray(arr, dtype=np.uint8).tobytes())
 
-# -------------------------------------------------
-# FAST, DETERMINISTIC 64-bit "simhash-like" sketch
-# (no huge random matrices; stable + cheap)
-# -------------------------------------------------
-def _mix64(x: np.uint64) -> np.uint64:
-    x ^= x >> np.uint64(33)
-    x *= np.uint64(0xff51afd7ed558ccd)
-    x ^= x >> np.uint64(33)
-    x *= np.uint64(0xc4ceb9fe1a85ec53)
-    x ^= x >> np.uint64(33)
-    return x
 
-def sketch64_from_ints(v: np.ndarray, seed: int) -> str:
-    """
-    Deterministic 64-bit sketch:
-    accumulate signed contributions per bit using hashed indices.
-    """
-    v = np.asarray(v).reshape(-1)
-    if v.size == 0:
-        return "0x0000000000000000"
-
-    acc = np.zeros((64,), dtype=np.int64)
-    s = np.uint64(seed)
-
-    # limit cost: if too long, sample uniformly
-    if v.size > 2048:
-        idx = np.linspace(0, v.size - 1, num=2048).astype(np.int64)
-        v = v[idx]
-
-    for i, val in enumerate(v):
-        # hash(index, seed) -> 64-bit
-        h = _mix64(np.uint64(i) ^ s)
-        # sign from value
-        w = int(val)
-        if w == 0:
-            continue
-        sign = 1 if w > 0 else -1
-        # contribute per bit of h
-        for b in range(64):
-            if (h >> np.uint64(b)) & np.uint64(1):
-                acc[b] += sign
-            else:
-                acc[b] -= sign
-
-    out = np.uint64(0)
-    for b in range(64):
-        if acc[b] >= 0:
-            out |= (np.uint64(1) << np.uint64(b))
-    return "0x" + format(int(out), "016x")
-
-def sketch64_from_floats(v: np.ndarray, seed: int) -> str:
-    v = np.asarray(v, dtype=np.float32).reshape(-1)
-    if v.size == 0:
-        return "0x0000000000000000"
-    # quantize to small ints
-    q = np.rint(np.clip(v, -3.0, 3.0) * 20.0).astype(np.int16)
-    return sketch64_from_ints(q, seed)
-
-# -------------------------------------------------
-# Feature extractors
-# melody: piptrack -> cents -> delta-steps int8
-# chroma: chroma_stft -> uint8 (T,12)
-# -------------------------------------------------
 def extract_melody_steps_int8(y: np.ndarray, sr: int, frames_per_sec=MELODY_FPS, fmin=80.0, fmax=1000.0) -> Tuple[np.ndarray, Dict[str, Any]]:
     import librosa
 
@@ -312,7 +240,6 @@ def extract_melody_steps_int8(y: np.ndarray, sr: int, frames_per_sec=MELODY_FPS,
     nz = (f0 > 0.0) & (voiced > 0.0)
     cents[nz] = 1200.0 * np.log2(f0[nz] / ref)
 
-    # median smooth
     if cents.size >= 5:
         k = 5
         pad = k // 2
@@ -322,7 +249,6 @@ def extract_melody_steps_int8(y: np.ndarray, sr: int, frames_per_sec=MELODY_FPS,
             cents_sm[i] = np.median(cents_pad[i:i+k])
         cents = cents_sm
 
-    # remove absolute pitch (center)
     if np.any(nz):
         med = np.median(cents[nz])
         cents = cents - float(med)
@@ -349,6 +275,7 @@ def extract_melody_steps_int8(y: np.ndarray, sr: int, frames_per_sec=MELODY_FPS,
     }
     return steps, meta
 
+
 def extract_chroma_uint8(y: np.ndarray, sr: int, frames_per_sec=CHROMA_FPS) -> Tuple[np.ndarray, Dict[str, Any]]:
     import librosa
 
@@ -364,7 +291,6 @@ def extract_chroma_uint8(y: np.ndarray, sr: int, frames_per_sec=CHROMA_FPS) -> T
     chroma = librosa.feature.chroma_stft(y=y, sr=sr, hop_length=hop, n_fft=n_fft).T
     chroma = chroma / (np.sum(chroma, axis=1, keepdims=True) + 1e-8)
 
-    # small smooth
     if chroma.shape[0] >= 5:
         k = 5
         pad = k // 2
@@ -387,43 +313,81 @@ def extract_chroma_uint8(y: np.ndarray, sr: int, frames_per_sec=CHROMA_FPS) -> T
     }
     return chroma_q, meta
 
-def build_qbh_from_audio(y: np.ndarray, sr: int, *, include_b64: bool) -> Dict[str, Any]:
-    mel_steps, mel_meta = extract_melody_steps_int8(y, sr)
-    chr_q, chr_meta = extract_chroma_uint8(y, sr)
 
+def _resample_1d_to(x: np.ndarray, L: int) -> np.ndarray:
+    x = np.asarray(x)
+    if x.size == 0:
+        return np.zeros((L,), dtype=np.float32)
+    if x.size == L:
+        return x.astype(np.float32)
+    xp = np.linspace(0.0, 1.0, num=x.size, dtype=np.float32)
+    xq = np.linspace(0.0, 1.0, num=L, dtype=np.float32)
+    y = np.interp(xq, xp, x.astype(np.float32))
+    return y.astype(np.float32)
+
+
+def _resample_2d_time_to(X: np.ndarray, T: int) -> np.ndarray:
+    X = np.asarray(X)
+    if X.shape[0] == 0:
+        return np.zeros((T, X.shape[1]), dtype=np.float32)
+    if X.shape[0] == T:
+        return X.astype(np.float32)
+    xp = np.linspace(0.0, 1.0, num=X.shape[0], dtype=np.float32)
+    xq = np.linspace(0.0, 1.0, num=T, dtype=np.float32)
+    out = np.zeros((T, X.shape[1]), dtype=np.float32)
+    for j in range(X.shape[1]):
+        out[:, j] = np.interp(xq, xp, X[:, j].astype(np.float32))
+    return out
+
+
+def simhash64(vec: np.ndarray, seed: int = 12345) -> str:
+    v = np.asarray(vec, dtype=np.float32).reshape(-1)
+    if v.size == 0:
+        return "0x0000000000000000"
+    rng = np.random.default_rng(seed)
+    H = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=(64, v.size), replace=True)
+    s = H @ v
+    bits = (s >= 0).astype(np.uint64)
+    out = np.uint64(0)
+    for i in range(64):
+        out |= (bits[i] << np.uint64(i))
+    return "0x" + format(int(out), "016x")
+
+
+def build_qbh_from_audio(y: np.ndarray, sr: int) -> Dict[str, Any]:
+    mel_steps, mel_meta = extract_melody_steps_int8(y, sr)
     mel_sha = mel_meta.get("sha256")
+
+    chr_q, chr_meta = extract_chroma_uint8(y, sr)
     chr_sha = chr_meta.get("sha256")
 
     combo = f"{mel_sha or ''}|{chr_sha or ''}".encode("utf-8", errors="ignore")
     key_sha = sha256_hex(combo) if (mel_sha or chr_sha) else None
 
-    # cheap stable sketches
-    mel_sim = sketch64_from_ints(mel_steps.astype(np.int16), seed=777)
-    chr_sim = sketch64_from_floats((chr_q.astype(np.float32) / 255.0).reshape(-1), seed=888)
+    mel_fixed = _resample_1d_to(mel_steps.astype(np.float32), 128)
+    chr_fixed = _resample_2d_time_to(chr_q.astype(np.float32) / 255.0, 48).reshape(-1)
 
-    melody_obj = {
-        "sha256": mel_sha,
-        "simhash64": mel_sim,
-        "T": int(mel_steps.shape[0]),
-        "meta": mel_meta,
-    }
-    chroma_obj = {
-        "sha256": chr_sha,
-        "simhash64": chr_sim,
-        "shape": [int(chr_q.shape[0]), 12],
-        "meta": chr_meta,
-    }
-
-    # only include b64 for query_extract (debug) to keep index small
-    if include_b64:
-        melody_obj["b64"] = b64_encode_int8(mel_steps)
-        chroma_obj["b64"] = b64_encode_uint8(chr_q)
+    mel_sim = simhash64(mel_fixed, seed=777)
+    chr_sim = simhash64(chr_fixed, seed=888)
 
     return {
+        "melody": {
+            "sha256": mel_sha,
+            "simhash64": mel_sim,
+            "b64": b64_encode_int8(mel_steps),
+            "T": int(mel_steps.shape[0]),
+            "meta": mel_meta,
+        },
+        "chroma": {
+            "sha256": chr_sha,
+            "simhash64": chr_sim,
+            "b64": b64_encode_uint8(chr_q),
+            "shape": [int(chr_q.shape[0]), 12],
+            "meta": chr_meta,
+        },
         "qbh_key_sha256": key_sha,
-        "melody": melody_obj,
-        "chroma": chroma_obj,
     }
+
 
 def window_offsets(duration: Optional[float], window_sec: float, hop_sec: float, max_windows: int) -> List[float]:
     if duration is None or duration <= window_sec:
@@ -435,17 +399,15 @@ def window_offsets(duration: Optional[float], window_sec: float, hop_sec: float,
     idx = sorted(set(int(x) for x in idx))
     return [float(i * hop_sec) for i in idx]
 
-# -------------------------------------------------
-# modes
-# -------------------------------------------------
+
 def process_query_extract(input_path: str, *, sr: int, max_seconds: float) -> Dict[str, Any]:
     wav = None
     try:
         wav = convert_to_wav_segment(input_path, sr=sr, start_sec=0.0, max_seconds=max_seconds + 0.25)
-        y, sr2 = load_wav_mono_float32(wav, sr_expected=sr, max_seconds=max_seconds)
+        y, sr2 = load_audio_librosa(wav, sr=sr, max_seconds=max_seconds)
         dur = float(y.size / max(float(sr2), 1.0))
 
-        qbh = build_qbh_from_audio(y, sr2, include_b64=True)
+        qbh = build_qbh_from_audio(y, sr2)
 
         return {
             "ok": True,
@@ -456,10 +418,9 @@ def process_query_extract(input_path: str, *, sr: int, max_seconds: float) -> Di
         }
     finally:
         if wav:
-            try:
-                os.unlink(wav)
-            except Exception:
-                pass
+            try: os.unlink(wav)
+            except Exception: pass
+
 
 def process_index_full(input_path: str, *, sr: int, window_sec: float, hop_sec: float, max_windows: int) -> Dict[str, Any]:
     dur = ffprobe_duration_seconds(input_path)
@@ -472,11 +433,11 @@ def process_index_full(input_path: str, *, sr: int, window_sec: float, hop_sec: 
         wav = None
         try:
             wav = convert_to_wav_segment(input_path, sr=sr, start_sec=off, max_seconds=window_sec + 0.25)
-            y, sr2 = load_wav_mono_float32(wav, sr_expected=sr, max_seconds=window_sec)
+            y, sr2 = load_audio_librosa(wav, sr=sr, max_seconds=window_sec)
             if y.size < int(0.6 * sr2):
                 continue
 
-            qbh = build_qbh_from_audio(y, sr2, include_b64=False)
+            qbh = build_qbh_from_audio(y, sr2)
 
             windows.append({
                 "t0": float(off),
@@ -487,17 +448,15 @@ def process_index_full(input_path: str, *, sr: int, window_sec: float, hop_sec: 
                 "melody_simhash64": qbh["melody"]["simhash64"],
                 "chroma_simhash64": qbh["chroma"]["simhash64"],
             })
-        except Exception:
+        except Exception as e:
+            # keep going, but if everything fails you'll get count=0
             continue
         finally:
             if wav:
-                try:
-                    os.unlink(wav)
-                except Exception:
-                    pass
+                try: os.unlink(wav)
+                except Exception: pass
 
     elapsed = time.time() - t0
-
     return {
         "ok": True,
         "mode": "index_full",
@@ -513,12 +472,11 @@ def process_index_full(input_path: str, *, sr: int, window_sec: float, hop_sec: 
         },
     }
 
-def main():
-    parsed = parse_args(sys.argv)
-    if parsed[-1] is not None:
-        return fail(parsed[-1], code=2)
 
-    file_path, mode, sr, max_seconds, window_seconds, hop_seconds, max_windows, _ = parsed
+def main():
+    file_path, mode, sr, max_seconds, window_seconds, hop_seconds, max_windows, err = parse_args(sys.argv)
+    if err:
+        return fail(err, code=2)
 
     try:
         if mode == "query_extract":
@@ -537,6 +495,7 @@ def main():
     except Exception as e:
         log("❌ Exception:\n" + traceback.format_exc())
         return fail("python_exception", code=1, extra={"msg": str(e)})
+
 
 if __name__ == "__main__":
     sys.exit(main())
